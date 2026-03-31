@@ -1,0 +1,577 @@
+from pathlib import Path
+
+from django.http import JsonResponse
+from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from bbot.models import UploadedFile
+from bbot.tasks import merge_large_file_task
+from utils.upload import (
+    build_stored_name,
+    calc_uploaded_file_md5,
+    get_avatar_upload_root,
+    get_temp_root,
+    get_upload_root,
+    get_user_relative_root,
+    get_user_upload_root,
+    join_relative_path,
+    media_url,
+    normalize_relative_path,
+    relative_to_uploads,
+    verify_chunk_md5,
+)
+from utils.validators import parse_parent_id, parse_category, validate_avatar_upload_file
+
+
+def index(request):
+    return JsonResponse({"data": "你好，世界"})
+
+
+def get_parent_dir(user, parent_id: int | None):
+    """获取父目录对象"""
+    if parent_id is None:
+        return None
+    parent = UploadedFile.objects.filter(id=parent_id, created_by=user, is_dir=True).first()
+    return parent
+
+
+def split_relative_upload_path(raw_relative_path: str, fallback_name: str) -> tuple[list[str], str]:
+    """分割相对路径为目录列表和文件名"""
+    normalized = normalize_relative_path(raw_relative_path)
+    if not normalized:
+        return [], fallback_name
+    segments = [item for item in normalized.split("/") if item]
+    if not segments:
+        return [], fallback_name
+    file_name = segments[-1] or fallback_name
+    return segments[:-1], file_name
+
+
+def ensure_child_folder(user, parent: UploadedFile | None, folder_name: str) -> UploadedFile:
+    """确保子文件夹存在"""
+    exists = UploadedFile.objects.filter(
+        created_by=user,
+        parent=parent,
+        is_dir=True,
+        display_name=folder_name,
+    ).first()
+    if exists:
+        return exists
+
+    if parent and parent.relative_path:
+        dir_relative_path = join_relative_path(parent.relative_path, folder_name)
+    else:
+        dir_relative_path = join_relative_path(get_user_relative_root(user), folder_name)
+
+    (get_upload_root() / Path(dir_relative_path)).mkdir(parents=True, exist_ok=True)
+    deleted_folder = UploadedFile.all_objects.filter(
+        created_by=user,
+        parent=parent,
+        is_dir=True,
+        display_name=folder_name,
+        deleted_at__isnull=False,
+    ).first()
+    if deleted_folder:
+        deleted_folder.deleted_at = None
+        deleted_folder.relative_path = dir_relative_path
+        deleted_folder.file_size = 0
+        deleted_folder.file_md5 = ""
+        deleted_folder.stored_name = folder_name
+        deleted_folder.save(update_fields=["deleted_at", "relative_path", "file_size", "file_md5", "stored_name", "updated_at"])
+        return deleted_folder
+
+    return UploadedFile.objects.create(
+        created_by=user,
+        parent=parent,
+        is_dir=True,
+        display_name=folder_name,
+        stored_name=folder_name,
+        relative_path=dir_relative_path,
+        file_size=0,
+        file_md5="",
+    )
+
+
+def ensure_nested_parent(user, base_parent: UploadedFile | None, folders: list[str]) -> UploadedFile | None:
+    """确保嵌套的父目录链路存在"""
+    current = base_parent
+    for folder_name in folders:
+        current = ensure_child_folder(user, current, folder_name)
+    return current
+
+
+def file_item_payload(item: UploadedFile):
+    return {
+        "id": item.id,
+        "display_name": item.display_name,
+        "stored_name": item.stored_name,
+        "is_dir": item.is_dir,
+        "parent_id": item.parent_id,
+        "file_size": item.file_size,
+        "file_md5": item.file_md5,
+        "relative_path": item.relative_path,
+        "url": "" if item.is_dir or not item.relative_path else media_url(item.relative_path),
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+class FileEntriesAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        parent_id = parse_parent_id(request.query_params.get("parent_id"))
+        parent = get_parent_dir(request.user, parent_id)
+        if parent_id is not None and parent is None:
+            return Response({"detail": "目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        query = UploadedFile.objects.filter(created_by=request.user, parent=parent).order_by("-is_dir", "display_name", "id")
+        items = [file_item_payload(item) for item in query]
+
+        breadcrumbs = [{"id": None, "name": "我的文件"}]
+        if parent:
+            chain: list[UploadedFile] = []
+            cursor = parent
+            while cursor:
+                chain.append(cursor)
+                cursor = cursor.parent
+            for node in reversed(chain):
+                breadcrumbs.append({"id": node.id, "name": node.display_name})
+
+        return Response(
+            {
+                "parent": None if not parent else {"id": parent.id, "display_name": parent.display_name},
+                "breadcrumbs": breadcrumbs,
+                "items": items,
+            }
+        )
+
+
+class SearchFileEntriesAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        keyword = str(request.query_params.get("keyword", "")).strip()
+        if not keyword:
+            return Response({"items": []})
+
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        matched_files = list(
+            UploadedFile.objects.filter(
+                created_by=request.user,
+                is_dir=False,
+                display_name__icontains=keyword,
+            )
+            .order_by("display_name", "id")[:limit]
+        )
+
+        all_dirs = UploadedFile.objects.filter(created_by=request.user, is_dir=True).values("id", "parent_id", "display_name")
+        dir_map = {
+            int(item["id"]): {
+                "parent_id": item["parent_id"],
+                "display_name": item["display_name"],
+            }
+            for item in all_dirs
+        }
+        path_cache: dict[int, str] = {}
+
+        def build_dir_path(dir_id: int | None) -> str:
+            if dir_id is None:
+                return ""
+            if dir_id in path_cache:
+                return path_cache[dir_id]
+
+            cursor = dir_id
+            chain: list[str] = []
+            visited: set[int] = set()
+            while cursor and cursor in dir_map and cursor not in visited:
+                visited.add(cursor)
+                node = dir_map[cursor]
+                chain.append(str(node["display_name"]))
+                parent_id = node["parent_id"]
+                cursor = int(parent_id) if parent_id else None
+
+            chain.reverse()
+            path = "/".join(chain)
+            path_cache[dir_id] = path
+            return path
+
+        items = []
+        for file_item in matched_files:
+            payload = file_item_payload(file_item)
+            directory_path = build_dir_path(file_item.parent_id)
+            full_path = f"{directory_path}/{file_item.display_name}" if directory_path else file_item.display_name
+            payload["directory_path"] = directory_path
+            payload["full_path"] = full_path
+            items.append(payload)
+
+        return Response({"items": items})
+
+
+class CreateFolderAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        parent_id = parse_parent_id(request.data.get("parent_id"))
+        parent = get_parent_dir(request.user, parent_id)
+        if parent_id is not None and parent is None:
+            return Response({"detail": "父目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        folder_name = str(request.data.get("name", "")).strip()
+        if not folder_name:
+            return Response({"detail": "文件夹名称不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        if "/" in folder_name or "\\" in folder_name:
+            return Response({"detail": "文件夹名称不合法"}, status=status.HTTP_400_BAD_REQUEST)
+
+        conflict = UploadedFile.objects.filter(created_by=request.user, parent=parent, display_name=folder_name).exists()
+        if conflict:
+            return Response({"detail": "同名文件或文件夹已存在"}, status=status.HTTP_400_BAD_REQUEST)
+
+        folder = ensure_child_folder(request.user, parent, folder_name)
+        return Response(file_item_payload(folder), status=status.HTTP_201_CREATED)
+
+
+class DeleteFileEntryAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        entry_id = parse_parent_id(request.data.get("id"))
+        if entry_id is None:
+            return Response({"detail": "参数不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        entry = UploadedFile.objects.filter(id=entry_id, created_by=request.user).first()
+        if not entry:
+            return Response({"detail": "文件或目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+        entry.delete()
+        return Response({"detail": "删除成功"})
+
+
+class RenameFileEntryAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        entry_id = parse_parent_id(request.data.get("id"))
+        new_name = str(request.data.get("name", "")).strip()
+        if entry_id is None or not new_name:
+            return Response({"detail": "参数不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if "/" in new_name or "\\" in new_name:
+            return Response({"detail": "名称不合法"}, status=status.HTTP_400_BAD_REQUEST)
+
+        entry = UploadedFile.objects.filter(id=entry_id, created_by=request.user).first()
+        if not entry:
+            return Response({"detail": "文件或目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        conflict = UploadedFile.objects.filter(
+            created_by=request.user,
+            parent=entry.parent,
+            display_name=new_name,
+        ).exclude(id=entry.id)
+        if conflict.exists():
+            return Response({"detail": "同名文件或文件夹已存在"}, status=status.HTTP_400_BAD_REQUEST)
+
+        entry.display_name = new_name
+        entry.save(update_fields=["display_name", "updated_at"])
+        return Response(file_item_payload(entry))
+
+
+class UploadSmallFileAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        file_obj = request.FILES.get("file")
+        category = parse_category(request.data.get("category", ""))
+        parent_id = parse_parent_id(request.data.get("parent_id"))
+        parent = get_parent_dir(request.user, parent_id)
+        relative_path = str(request.data.get("relative_path", ""))
+
+        if not file_obj:
+            return Response({"detail": "缺少文件"}, status=status.HTTP_400_BAD_REQUEST)
+        if category is None:
+            return Response({"detail": "category不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if parent_id is not None and parent is None:
+            return Response({"detail": "目标目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        nested_folders, display_name = split_relative_upload_path(relative_path, file_obj.name)
+        target_parent = ensure_nested_parent(request.user, parent, nested_folders)
+
+        # 头像文件单独存储，不进入用户文件管理树
+        if category == "profile":
+            if parent_id is not None or normalize_relative_path(relative_path):
+                return Response({"detail": "头像上传不支持目录参数"}, status=status.HTTP_400_BAD_REQUEST)
+
+            avatar_file_error = validate_avatar_upload_file(file_obj)
+            if avatar_file_error:
+                return Response({"detail": avatar_file_error}, status=status.HTTP_400_BAD_REQUEST)
+
+            display_name = file_obj.name
+            target_dir = get_avatar_upload_root(request.user)
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            stored_name = build_stored_name(display_name)
+            target_path = target_dir / stored_name
+            with target_path.open("wb") as f:
+                for chunk in file_obj.chunks():
+                    f.write(chunk)
+
+            avatar_relative_path = relative_to_uploads(target_path)
+            avatar_url = media_url(avatar_relative_path)
+            return Response(
+                {
+                    "mode": "direct",
+                    "file": {
+                        "id": 0,
+                        "display_name": display_name,
+                        "stored_name": stored_name,
+                        "is_dir": False,
+                        "parent_id": None,
+                        "file_size": int(file_obj.size),
+                        "file_md5": "",
+                        "relative_path": avatar_relative_path,
+                        "url": avatar_url,
+                        "created_at": None,
+                        "updated_at": None,
+                    },
+                }
+            )
+
+        file_md5 = calc_uploaded_file_md5(file_obj)
+        existing = UploadedFile.objects.filter(created_by=request.user, file_md5=file_md5, is_dir=False).first()
+        if existing:
+            duplicated = UploadedFile.objects.filter(
+                created_by=request.user,
+                parent=target_parent,
+                display_name=display_name,
+                is_dir=False,
+            ).first()
+            if not duplicated:
+                duplicated = UploadedFile.objects.create(
+                    created_by=request.user,
+                    parent=target_parent,
+                    is_dir=False,
+                    display_name=display_name,
+                    stored_name=existing.stored_name,
+                    file_md5=file_md5,
+                    file_size=existing.file_size,
+                    relative_path=existing.relative_path,
+                )
+            return Response(
+                {
+                    "mode": "instant",
+                    "file": file_item_payload(duplicated),
+                }
+            )
+
+        target_dir = get_user_upload_root(request.user) if not target_parent else (get_upload_root() / Path(target_parent.relative_path))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_name = build_stored_name(display_name)
+        target_path = target_dir / stored_name
+        with target_path.open("wb") as f:
+            for chunk in file_obj.chunks():
+                f.write(chunk)
+
+        relative_path = relative_to_uploads(target_path)
+        file_record = UploadedFile.objects.create(
+            file_md5=file_md5,
+            file_size=int(file_obj.size),
+            relative_path=relative_path,
+            created_by=request.user,
+            parent=target_parent,
+            is_dir=False,
+            stored_name=stored_name,
+            display_name=display_name,
+        )
+
+        return Response(
+            {
+                "mode": "direct",
+                "file": file_item_payload(file_record),
+            }
+        )
+
+
+class UploadPrecheckAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        file_md5 = str(request.data.get("file_md5", "")).strip().lower()
+        file_name = str(request.data.get("file_name", "")).strip()
+        category = parse_category(request.data.get("category", ""))
+        parent_id = parse_parent_id(request.data.get("parent_id"))
+        parent = get_parent_dir(request.user, parent_id)
+        relative_path = str(request.data.get("relative_path", ""))
+        try:
+            file_size = int(request.data.get("file_size", 0))
+        except (TypeError, ValueError):
+            file_size = 0
+
+        if len(file_md5) != 32:
+            return Response({"detail": "file_md5不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if not file_name:
+            return Response({"detail": "缺少file_name"}, status=status.HTTP_400_BAD_REQUEST)
+        if category is None:
+            return Response({"detail": "category不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if file_size <= 0:
+            return Response({"detail": "file_size不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if category == "profile":
+            return Response({"detail": "头像上传请走小文件直传接口"}, status=status.HTTP_400_BAD_REQUEST)
+        if parent_id is not None and parent is None:
+            return Response({"detail": "目标目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        nested_folders, display_name = split_relative_upload_path(relative_path, file_name)
+        target_parent = ensure_nested_parent(request.user, parent, nested_folders)
+
+        existing = UploadedFile.objects.filter(created_by=request.user, file_md5=file_md5, is_dir=False).first()
+        if existing:
+            duplicated = UploadedFile.objects.filter(
+                created_by=request.user,
+                parent=target_parent,
+                display_name=display_name,
+                is_dir=False,
+            ).first()
+            if not duplicated:
+                duplicated = UploadedFile.objects.create(
+                    created_by=request.user,
+                    parent=target_parent,
+                    is_dir=False,
+                    display_name=display_name,
+                    stored_name=existing.stored_name,
+                    file_md5=file_md5,
+                    file_size=existing.file_size,
+                    relative_path=existing.relative_path,
+                )
+            return Response(
+                {
+                    "exists": True,
+                    "message": "文件已存在，秒传成功",
+                    "file": file_item_payload(duplicated),
+                }
+            )
+
+        return Response(
+            {
+                "exists": False,
+                "message": "文件不存在，开始分片上传",
+            }
+        )
+
+
+class UploadedChunksAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        file_md5 = str(request.query_params.get("file_md5", "")).strip().lower()
+        if len(file_md5) != 32:
+            return Response({"detail": "file_md5不合法"}, status=status.HTTP_400_BAD_REQUEST)
+
+        temp_dir = get_temp_root() / f"{request.user.id}_{file_md5}"
+        if not temp_dir.exists():
+            return Response({"uploaded_chunks": []})
+
+        uploaded_chunks: list[int] = []
+        for path in temp_dir.iterdir():
+            if path.is_file() and path.name.isdigit():
+                uploaded_chunks.append(int(path.name))
+        uploaded_chunks.sort()
+        return Response({"uploaded_chunks": uploaded_chunks})
+
+
+class UploadChunkAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        file_obj = request.FILES.get("chunk")
+        file_md5 = str(request.data.get("file_md5", "")).strip().lower()
+        try:
+            chunk_index = int(request.data.get("chunk_index", 0))
+        except (TypeError, ValueError):
+            chunk_index = 0
+        chunk_md5 = str(request.data.get("chunk_md5", "")).strip().lower()
+
+        if not file_obj:
+            return Response({"detail": "缺少分片文件"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(file_md5) != 32 or chunk_index <= 0:
+            return Response({"detail": "参数不合法"}, status=status.HTTP_400_BAD_REQUEST)
+
+        temp_dir = get_temp_root() / f"{request.user.id}_{file_md5}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        chunk_path = temp_dir / str(chunk_index)
+
+        with chunk_path.open("wb") as f:
+            for part in file_obj.chunks():
+                f.write(part)
+
+        if len(chunk_md5) == 32:
+            if not verify_chunk_md5(chunk_path, chunk_md5):
+                chunk_path.unlink(missing_ok=True)
+                return Response({"detail": "分片MD5校验失败"}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"chunk_index": chunk_index, "uploaded": True})
+
+
+class UploadMergeAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        file_md5 = str(request.data.get("file_md5", "")).strip().lower()
+        total_md5 = str(request.data.get("total_md5", "")).strip().lower()
+        file_name = str(request.data.get("file_name", "")).strip()
+        category = parse_category(request.data.get("category", ""))
+        parent_id = parse_parent_id(request.data.get("parent_id"))
+        parent = get_parent_dir(request.user, parent_id)
+        relative_path = str(request.data.get("relative_path", ""))
+        try:
+            total_chunks = int(request.data.get("total_chunks", 0))
+            file_size = int(request.data.get("file_size", 0))
+        except (TypeError, ValueError):
+            total_chunks = 0
+            file_size = 0
+
+        if len(file_md5) != 32 or len(total_md5) != 32 or not file_name or total_chunks <= 0:
+            return Response({"detail": "参数不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if category is None:
+            return Response({"detail": "category不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if category == "profile":
+            return Response({"detail": "头像上传请走小文件直传接口"}, status=status.HTTP_400_BAD_REQUEST)
+        if file_size <= 0:
+            return Response({"detail": "file_size不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if parent_id is not None and parent is None:
+            return Response({"detail": "目标目录不存在"}, status=status.HTTP_404_NOT_FOUND)
+
+        nested_folders, display_name = split_relative_upload_path(relative_path, file_name)
+        target_parent = ensure_nested_parent(request.user, parent, nested_folders)
+
+        temp_dir = get_temp_root() / f"{request.user.id}_{file_md5}"
+        missing_chunks: list[int] = []
+        for idx in range(1, total_chunks + 1):
+            if not (temp_dir / str(idx)).exists():
+                missing_chunks.append(idx)
+
+        if missing_chunks:
+            return Response(
+                {
+                    "detail": "分片未上传完整",
+                    "missing_chunks": missing_chunks,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        task = merge_large_file_task.delay(
+            file_md5=file_md5,
+            total_chunks=total_chunks,
+            file_name=file_name,
+            display_name=display_name,
+            total_md5=total_md5,
+            file_size=file_size,
+            user_id=request.user.id,
+            parent_id=target_parent.id if target_parent else None,
+        )
+        return Response({"task_id": task.id, "message": "已提交后台合并任务"})

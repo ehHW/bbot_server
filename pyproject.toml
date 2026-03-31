@@ -1,0 +1,19 @@
+[project]
+name = "bbot-server"
+version = "0.1.0"
+description = "Bbot 服务端项目"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "celery[redis]>=5.5.3",
+  "channels>=4.3.1",
+  "channels-redis>=4.3.0",
+  "django==5.2",
+  "django-cors-headers>=4.9.0",
+  "django-environ>=0.13.0",
+  "djangorestframework>=3.17.1",
+  "djangorestframework-simplejwt>=5.5.1",
+  "pymysql>=1.1.2",
+  "requests>=2.32.5",
+  "uvicorn[standard]>=0.42.0",
+]
