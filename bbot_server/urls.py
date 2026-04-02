@@ -22,6 +22,8 @@ from django.urls import include, path
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("bbot/", include(("bbot.urls", "bbot"), namespace="bbot_web")),
+    path("api/chat/", include(("chat.urls", "chat"), namespace="chat_api")),
+    path("api/game/", include(("game.urls", "game"), namespace="game_api")),
     path("api/", include("user.urls")),
     path("api/", include(("bbot.urls", "bbot"), namespace="bbot_api")),
 ]
