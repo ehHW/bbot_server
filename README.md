@@ -1,6 +1,6 @@
 # bbot_server 后端
 
-基于 Django + DRF + Channels + JWT 的服务端，当前对应 V1 已完成版本。
+基于 Django + DRF + Channels + JWT 的服务端。当前主线在 V1 可用版本基础上，已经落地一批 Chat V2 分层重构与附件消息能力。
 
 项目当前覆盖以下核心业务：
 
@@ -8,7 +8,7 @@
 - 用户 / 角色 / 权限管理
 - 资源中心文件管理与上传
 - 回收站与去重恢复
-- 聊天室 V1
+- 聊天室 V1 + V2 过渡能力
 - WebSocket 实时事件
 - Celery 异步上传合并与相关任务支撑
 
@@ -79,6 +79,12 @@ CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/3
 python manage.py migrate
 ```
 
+运行聊天相关回归测试：
+
+```bash
+python manage.py test chat.tests
+```
+
 可选：创建管理后台账号
 
 ```bash
@@ -129,7 +135,7 @@ python manage.py cleanup_recycle_bin
 
 建议每天定时执行一次。
 
-## 当前 V1 模块说明
+## 当前模块说明
 
 ### 认证与权限
 
@@ -148,16 +154,27 @@ python manage.py cleanup_recycle_bin
 - 基于 MD5 的重复文件识别
 - 回收站同 MD5 文件恢复到用户当前选定目录
 
-### 聊天室 V1
+### 聊天室
 
 - 单聊与群聊会话
 - 好友申请、好友列表、好友备注
 - 群创建、邀请、退群、成员管理
-- 文本消息历史查询
+- 文本消息与附件消息
+- 文本 / 附件消息历史查询
 - 未读数更新与已读同步
 - 会话隐藏、置顶、个人会话偏好
 - 聊天搜索
 - 管理员聊天巡检接口
+- 全员禁言、群角色与群主权限控制
+
+## Chat V2 进展
+
+当前后端已经完成以下 V2 方向改造：
+
+- chat 模块已从单一 services 模式演进为 application commands / queries 与 domain 规则分层
+- WebSocket 广播事件已收敛为标准化 envelope，便于前端统一消费
+- 附件消息发送已经接入 chat/application/commands/attachments.py
+- 自聊、自身会话、群权限与禁言等规则已补充回归测试
 
 ## 主要 REST 路由
 
@@ -193,6 +210,8 @@ python manage.py cleanup_recycle_bin
 - /api/chat/settings/
 - /api/chat/admin/conversations/
 - /api/chat/admin/messages/
+
+当前 WebSocket 命令除文本消息外，还包含附件消息发送相关动作；事件广播统一通过聊天域事件下发。
 
 ### 其他
 
@@ -233,5 +252,5 @@ bbot_server/
 
 ## 备注
 
-- 当前聊天室 V1 仅支持文本消息，不包含图片、文件消息发送。
+- 当前仓库仍保留部分 V1 文档与命名，但聊天主线代码已经进入 V2 渐进重构阶段。
 - 回收站去重恢复逻辑会优先尝试复用同 MD5 文件，并将恢复目标落到用户当前所选目录。
