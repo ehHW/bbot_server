@@ -16,6 +16,7 @@ from user.serializers import (
 	ProfileUpdateSerializer,
 	RoleSerializer,
 	UserSerializer,
+	SUPER_ADMIN_ONLY_PERMISSION_CODES,
 )
 from utils.audit import write_audit_log
 from ws.events import notify_user_force_logout
@@ -256,6 +257,8 @@ class RoleViewSet(viewsets.ModelViewSet):
 	def get_queryset(self):
 		ensure_super_admin_role()
 		queryset = super().get_queryset()
+		if not self.request.user.is_superuser:
+			queryset = queryset.exclude(permissions__code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES)
 		keyword = self.request.query_params.get("keyword", "").strip()
 		if keyword:
 			queryset = queryset.filter(
@@ -267,6 +270,9 @@ class RoleViewSet(viewsets.ModelViewSet):
 		return queryset
 
 	def create(self, request, *args, **kwargs):
+		requested_permission_ids = request.data.get("permission_ids") or []
+		if not request.user.is_superuser and Permission.objects.filter(id__in=requested_permission_ids, code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES).exists():
+			return Response({"detail": "该权限仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		response = super().create(request, *args, **kwargs)
 		target = Role.objects.filter(pk=response.data.get("id")).first() if isinstance(response.data, dict) else None
 		write_audit_log(request, "create", "success", detail="创建角色成功", target=target)
@@ -274,6 +280,8 @@ class RoleViewSet(viewsets.ModelViewSet):
 
 	def update(self, request, *args, **kwargs):
 		role = self.get_object()
+		if not request.user.is_superuser and role.permissions.filter(code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES).exists():
+			return Response({"detail": "该角色仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		if role.is_super_admin_role():
 			write_audit_log(request, "protect_block", "blocked", detail="尝试编辑超级管理员角色", target=role)
 			return Response({"detail": "超级管理员角色禁止编辑"}, status=status.HTTP_403_FORBIDDEN)
@@ -283,6 +291,8 @@ class RoleViewSet(viewsets.ModelViewSet):
 
 	def partial_update(self, request, *args, **kwargs):
 		role = self.get_object()
+		if not request.user.is_superuser and role.permissions.filter(code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES).exists():
+			return Response({"detail": "该角色仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		if role.is_super_admin_role():
 			write_audit_log(request, "protect_block", "blocked", detail="尝试部分编辑超级管理员角色", target=role)
 			return Response({"detail": "超级管理员角色禁止编辑"}, status=status.HTTP_403_FORBIDDEN)
@@ -292,6 +302,8 @@ class RoleViewSet(viewsets.ModelViewSet):
 
 	def destroy(self, request, *args, **kwargs):
 		role = self.get_object()
+		if not request.user.is_superuser and role.permissions.filter(code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES).exists():
+			return Response({"detail": "该角色仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		if role.is_super_admin_role():
 			write_audit_log(request, "protect_block", "blocked", detail="尝试删除超级管理员角色", target=role)
 			return Response({"detail": "超级管理员角色禁止删除"}, status=status.HTTP_403_FORBIDDEN)
@@ -318,6 +330,8 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 	def get_queryset(self):
 		queryset = super().get_queryset()
+		if not self.request.user.is_superuser:
+			queryset = queryset.exclude(code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES)
 		keyword = self.request.query_params.get("keyword", "").strip()
 		if keyword:
 			queryset = queryset.filter(
@@ -329,7 +343,7 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 	def create(self, request, *args, **kwargs):
 		permission_code = str(request.data.get("code", "")).strip()
-		if _is_core_permission_code(permission_code) and not request.user.is_superuser:
+		if (_is_core_permission_code(permission_code) or permission_code in SUPER_ADMIN_ONLY_PERMISSION_CODES) and not request.user.is_superuser:
 			write_audit_log(request, "protect_block", "blocked", detail="非超级管理员尝试创建核心权限", metadata={"code": permission_code})
 			return Response({"detail": "核心权限仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		response = super().create(request, *args, **kwargs)
@@ -339,7 +353,7 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 	def update(self, request, *args, **kwargs):
 		target = self.get_object()
-		if _is_core_permission_code(target.code) and not request.user.is_superuser:
+		if (_is_core_permission_code(target.code) or target.code in SUPER_ADMIN_ONLY_PERMISSION_CODES) and not request.user.is_superuser:
 			write_audit_log(request, "protect_block", "blocked", detail="非超级管理员尝试更新核心权限", target=target)
 			return Response({"detail": "核心权限仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		response = super().update(request, *args, **kwargs)
@@ -348,7 +362,7 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 	def partial_update(self, request, *args, **kwargs):
 		target = self.get_object()
-		if _is_core_permission_code(target.code) and not request.user.is_superuser:
+		if (_is_core_permission_code(target.code) or target.code in SUPER_ADMIN_ONLY_PERMISSION_CODES) and not request.user.is_superuser:
 			write_audit_log(request, "protect_block", "blocked", detail="非超级管理员尝试部分更新核心权限", target=target)
 			return Response({"detail": "核心权限仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		response = super().partial_update(request, *args, **kwargs)
@@ -357,7 +371,7 @@ class PermissionViewSet(viewsets.ModelViewSet):
 
 	def destroy(self, request, *args, **kwargs):
 		target = self.get_object()
-		if _is_core_permission_code(target.code) and not request.user.is_superuser:
+		if (_is_core_permission_code(target.code) or target.code in SUPER_ADMIN_ONLY_PERMISSION_CODES) and not request.user.is_superuser:
 			write_audit_log(request, "protect_block", "blocked", detail="非超级管理员尝试删除核心权限", target=target)
 			return Response({"detail": "核心权限仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
 		response = super().destroy(request, *args, **kwargs)

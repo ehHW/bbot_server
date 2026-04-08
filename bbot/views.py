@@ -1,9 +1,11 @@
 from datetime import timedelta
 from pathlib import Path
+import shutil
 
 from django.http import JsonResponse
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -11,7 +13,9 @@ from rest_framework.views import APIView
 
 from bbot.models import UploadedFile
 from bbot.recycle_bin import (
+    RECYCLE_BIN_DISPLAY_NAME,
     RECYCLE_BIN_EXPIRE_DAYS,
+    RECYCLE_BIN_STORED_NAME,
     clear_recycle_bin,
     ensure_user_recycle_bin,
     is_recycle_bin_folder,
@@ -62,8 +66,16 @@ def split_relative_upload_path(raw_relative_path: str, fallback_name: str) -> tu
     return segments[:-1], file_name
 
 
+def is_reserved_system_folder_name(name: str) -> bool:
+    normalized = str(name).strip()
+    return normalized in {RECYCLE_BIN_DISPLAY_NAME, RECYCLE_BIN_STORED_NAME}
+
+
 def ensure_child_folder(user, parent: UploadedFile | None, folder_name: str) -> UploadedFile:
     """确保子文件夹存在"""
+    if is_reserved_system_folder_name(folder_name):
+        raise ValidationError({"detail": '“回收站”是系统保留目录名称，请使用其他名称'})
+
     exists = UploadedFile.objects.filter(
         created_by=user,
         parent=parent,
@@ -113,6 +125,138 @@ def ensure_nested_parent(user, base_parent: UploadedFile | None, folders: list[s
     for folder_name in folders:
         current = ensure_child_folder(user, current, folder_name)
     return current
+
+
+def get_active_target_file(user, target_parent: UploadedFile | None, display_name: str) -> UploadedFile | None:
+    return UploadedFile.objects.filter(
+        created_by=user,
+        parent=target_parent,
+        display_name=display_name,
+        is_dir=False,
+        recycled_at__isnull=True,
+    ).first()
+
+
+def resolve_target_file_storage(
+    user,
+    target_parent: UploadedFile | None,
+    display_name: str,
+    preferred_stored_name: str,
+    current_relative_path: str | None = None,
+) -> tuple[str, Path, str]:
+    target_dir = get_user_upload_root(user) if not target_parent else (get_upload_root() / Path(target_parent.relative_path))
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stored_name = preferred_stored_name or build_stored_name(display_name)
+    target_path = target_dir / stored_name
+    target_relative_path = relative_to_uploads(target_path)
+
+    if target_path.exists() and target_relative_path != (current_relative_path or ""):
+        stored_name = build_stored_name(display_name)
+        target_path = target_dir / stored_name
+        target_relative_path = relative_to_uploads(target_path)
+
+    return stored_name, target_path, target_relative_path
+
+
+def relocate_recycled_file_to_target(
+    user,
+    existing: UploadedFile,
+    target_parent: UploadedFile | None,
+    display_name: str,
+) -> None:
+    current_relative_path = str(existing.relative_path or "")
+    stored_name, target_path, target_relative_path = resolve_target_file_storage(
+        user,
+        target_parent,
+        display_name,
+        existing.stored_name,
+        current_relative_path=current_relative_path,
+    )
+
+    if target_relative_path == current_relative_path:
+        existing.stored_name = stored_name
+        existing.relative_path = target_relative_path
+        return
+
+    source_path = get_upload_root() / Path(current_relative_path)
+    if not source_path.exists() or not source_path.is_file():
+        raise ValidationError({"detail": "回收站中的源文件不存在，无法恢复到目标目录"})
+
+    has_other_active_refs = UploadedFile.objects.filter(
+        relative_path=current_relative_path,
+        is_dir=False,
+        deleted_at__isnull=True,
+        recycled_at__isnull=True,
+    ).exclude(id=existing.id).exists()
+
+    if has_other_active_refs:
+        shutil.copy2(source_path, target_path)
+    else:
+        shutil.move(str(source_path), str(target_path))
+
+    existing.stored_name = stored_name
+    existing.relative_path = target_relative_path
+
+
+def materialize_existing_upload_file(
+    user,
+    existing: UploadedFile,
+    target_parent: UploadedFile | None,
+    display_name: str,
+) -> tuple[UploadedFile, bool]:
+    target_existing = get_active_target_file(user, target_parent, display_name)
+    if target_existing:
+        if target_existing.file_md5 == existing.file_md5:
+            return target_existing, False
+        raise ValidationError({"detail": "目标目录已存在同名文件，但内容不同，请先重命名或删除原文件"})
+
+    if existing.recycled_at is not None:
+        relocate_recycled_file_to_target(user, existing, target_parent, display_name)
+        existing.parent = target_parent
+        existing.display_name = display_name
+        existing.recycled_at = None
+        existing.recycle_original_parent = None
+        existing.save(update_fields=["parent", "display_name", "stored_name", "relative_path", "recycled_at", "recycle_original_parent", "updated_at"])
+        return existing, True
+
+    duplicated = UploadedFile.objects.create(
+        created_by=user,
+        parent=target_parent,
+        is_dir=False,
+        display_name=display_name,
+        stored_name=existing.stored_name,
+        file_md5=existing.file_md5,
+        file_size=existing.file_size,
+        relative_path=existing.relative_path,
+    )
+    return duplicated, False
+
+
+def resolve_existing_upload_file(
+    user,
+    file_md5: str,
+    target_parent: UploadedFile | None,
+    display_name: str,
+) -> tuple[UploadedFile | None, bool]:
+    existing = UploadedFile.objects.filter(
+        created_by=user,
+        file_md5=file_md5,
+        is_dir=False,
+        recycled_at__isnull=True,
+    ).first()
+    if not existing:
+        existing = UploadedFile.objects.filter(
+            created_by=user,
+            file_md5=file_md5,
+            is_dir=False,
+            recycled_at__isnull=False,
+        ).order_by("-recycled_at", "-id").first()
+
+    if not existing:
+        return None, False
+
+    return materialize_existing_upload_file(user, existing, target_parent, display_name)
 
 
 def file_item_payload(item: UploadedFile):
@@ -257,6 +401,8 @@ class CreateFolderAPIView(APIView):
             return Response({"detail": "文件夹名称不能为空"}, status=status.HTTP_400_BAD_REQUEST)
         if "/" in folder_name or "\\" in folder_name:
             return Response({"detail": "文件夹名称不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if is_reserved_system_folder_name(folder_name):
+            return Response({"detail": '“回收站”是系统保留目录名称，请使用其他名称'}, status=status.HTTP_400_BAD_REQUEST)
 
         conflict = UploadedFile.objects.filter(created_by=request.user, parent=parent, display_name=folder_name).exists()
         if conflict:
@@ -297,6 +443,8 @@ class RenameFileEntryAPIView(APIView):
             return Response({"detail": "参数不合法"}, status=status.HTTP_400_BAD_REQUEST)
         if "/" in new_name or "\\" in new_name:
             return Response({"detail": "名称不合法"}, status=status.HTTP_400_BAD_REQUEST)
+        if is_reserved_system_folder_name(new_name):
+            return Response({"detail": '“回收站”是系统保留目录名称，请使用其他名称'}, status=status.HTTP_400_BAD_REQUEST)
 
         entry = UploadedFile.objects.filter(id=entry_id, created_by=request.user).first()
         if not entry:
@@ -425,29 +573,13 @@ class UploadSmallFileAPIView(APIView):
             )
 
         file_md5 = calc_uploaded_file_md5(file_obj)
-        existing = UploadedFile.objects.filter(created_by=request.user, file_md5=file_md5, is_dir=False).first()
+        existing, restored_from_recycle = resolve_existing_upload_file(request.user, file_md5, target_parent, display_name)
         if existing:
-            duplicated = UploadedFile.objects.filter(
-                created_by=request.user,
-                parent=target_parent,
-                display_name=display_name,
-                is_dir=False,
-            ).first()
-            if not duplicated:
-                duplicated = UploadedFile.objects.create(
-                    created_by=request.user,
-                    parent=target_parent,
-                    is_dir=False,
-                    display_name=display_name,
-                    stored_name=existing.stored_name,
-                    file_md5=file_md5,
-                    file_size=existing.file_size,
-                    relative_path=existing.relative_path,
-                )
             return Response(
                 {
                     "mode": "instant",
-                    "file": file_item_payload(duplicated),
+                    "restored_from_recycle": restored_from_recycle,
+                    "file": file_item_payload(existing),
                 }
             )
 
@@ -510,30 +642,14 @@ class UploadPrecheckAPIView(APIView):
         nested_folders, display_name = split_relative_upload_path(relative_path, file_name)
         target_parent = ensure_nested_parent(request.user, parent, nested_folders)
 
-        existing = UploadedFile.objects.filter(created_by=request.user, file_md5=file_md5, is_dir=False).first()
+        existing, restored_from_recycle = resolve_existing_upload_file(request.user, file_md5, target_parent, display_name)
         if existing:
-            duplicated = UploadedFile.objects.filter(
-                created_by=request.user,
-                parent=target_parent,
-                display_name=display_name,
-                is_dir=False,
-            ).first()
-            if not duplicated:
-                duplicated = UploadedFile.objects.create(
-                    created_by=request.user,
-                    parent=target_parent,
-                    is_dir=False,
-                    display_name=display_name,
-                    stored_name=existing.stored_name,
-                    file_md5=file_md5,
-                    file_size=existing.file_size,
-                    relative_path=existing.relative_path,
-                )
             return Response(
                 {
                     "exists": True,
-                    "message": "文件已存在，秒传成功",
-                    "file": file_item_payload(duplicated),
+                    "message": "文件已在回收站中恢复" if restored_from_recycle else "文件已存在，秒传成功",
+                    "restored_from_recycle": restored_from_recycle,
+                    "file": file_item_payload(existing),
                 }
             )
 

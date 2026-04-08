@@ -16,6 +16,12 @@ DEFAULT_PERMISSIONS = [
     ("user.create_permission", "创建权限"),
     ("user.update_permission", "修改权限"),
     ("user.delete_permission", "删除权限"),
+    ("chat.view_conversation", "查看会话"),
+    ("chat.send_message", "发送消息"),
+    ("chat.create_group", "创建群聊"),
+    ("chat.manage_group", "管理群聊"),
+    ("chat.add_friend", "添加好友"),
+    ("chat.review_all_messages", "查看全部聊天记录"),
 ]
 
 SUPER_ADMIN_ROLE_NAME = "超级管理员"

@@ -2,9 +2,12 @@
 WebSocket 消费者 - 处理客户端连接和消息
 """
 from celery.result import AsyncResult
+from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from bbot_server.celery import app as celery_app
+from chat.services import prepare_mark_read, prepare_send_text_message, prepare_typing_payload
 
 
 class GlobalWebSocketConsumer(AsyncJsonWebsocketConsumer):
@@ -34,6 +37,142 @@ class GlobalWebSocketConsumer(AsyncJsonWebsocketConsumer):
             }
         )
 
+    async def _send_user_payload(self, user_id: int, payload: dict):
+        await self.channel_layer.group_send(
+            f"ws_user_{user_id}",
+            {
+                "type": "system.event",
+                "payload": payload,
+            },
+        )
+
+    async def _handle_chat_send_message(self, content: dict):
+        conversation_id = content.get("conversation_id")
+        try:
+            payload = await database_sync_to_async(prepare_send_text_message)(
+                self.scope["user"],
+                int(conversation_id),
+                content=str(content.get("content", "")),
+                client_message_id=str(content.get("client_message_id", "")).strip() or None,
+            )
+        except (TypeError, ValueError):
+            await self.send_json({"type": "error", "message": "conversation_id 非法", "event": "chat_send_message"})
+            return
+        except ValidationError as exc:
+            await self.send_json({"type": "error", "message": self._normalize_error(exc), "event": "chat_send_message"})
+            return
+        except PermissionDenied as exc:
+            await self.send_json({"type": "error", "message": str(exc), "event": "chat_send_message"})
+            return
+
+        await self._send_user_payload(
+            self.scope["user"].id,
+            {
+                "type": "chat_message_ack",
+                "conversation_id": payload["conversation_id"],
+                "client_message_id": str(content.get("client_message_id", "")).strip() or None,
+                "message": payload["message"],
+                "conversation": payload["sender_conversation"],
+            },
+        )
+
+        for recipient in payload["recipients"]:
+            await self._send_user_payload(
+                recipient["user_id"],
+                {
+                    "type": "chat_new_message",
+                    "conversation_id": payload["conversation_id"],
+                    "message": payload["message"],
+                },
+            )
+            await self._send_user_payload(
+                recipient["user_id"],
+                {
+                    "type": "chat_conversation_updated",
+                    "conversation": recipient["conversation"],
+                },
+            )
+            await self._send_user_payload(
+                recipient["user_id"],
+                {
+                    "type": "chat_unread_updated",
+                    "conversation_id": payload["conversation_id"],
+                    "unread_count": recipient["unread_count"],
+                    "total_unread_count": recipient["total_unread_count"],
+                },
+            )
+
+    async def _handle_chat_mark_read(self, content: dict):
+        conversation_id = content.get("conversation_id")
+        last_read_sequence = content.get("last_read_sequence")
+        try:
+            payload = await database_sync_to_async(prepare_mark_read)(
+                self.scope["user"],
+                int(conversation_id),
+                last_read_sequence=int(last_read_sequence),
+            )
+        except (TypeError, ValueError):
+            await self.send_json({"type": "error", "message": "会话或已读序号非法", "event": "chat_mark_read"})
+            return
+        except ValidationError as exc:
+            await self.send_json({"type": "error", "message": self._normalize_error(exc), "event": "chat_mark_read"})
+            return
+        except PermissionDenied as exc:
+            await self.send_json({"type": "error", "message": str(exc), "event": "chat_mark_read"})
+            return
+
+        await self._send_user_payload(
+            self.scope["user"].id,
+            {
+                "type": "chat_unread_updated",
+                "conversation_id": payload["conversation_id"],
+                "unread_count": payload["unread_count"],
+                "total_unread_count": payload["total_unread_count"],
+                "last_read_sequence": payload["last_read_sequence"],
+            },
+        )
+
+    async def _handle_chat_typing(self, content: dict):
+        conversation_id = content.get("conversation_id")
+        try:
+            payload = await database_sync_to_async(prepare_typing_payload)(
+                self.scope["user"],
+                int(conversation_id),
+                is_typing=bool(content.get("is_typing", False)),
+            )
+        except (TypeError, ValueError):
+            await self.send_json({"type": "error", "message": "conversation_id 非法", "event": "chat_typing"})
+            return
+        except ValidationError as exc:
+            await self.send_json({"type": "error", "message": self._normalize_error(exc), "event": "chat_typing"})
+            return
+        except PermissionDenied as exc:
+            await self.send_json({"type": "error", "message": str(exc), "event": "chat_typing"})
+            return
+
+        for user_id in payload["target_user_ids"]:
+            await self._send_user_payload(
+                user_id,
+                {
+                    "type": "chat_typing",
+                    "conversation_id": payload["conversation_id"],
+                    "user": payload["user"],
+                    "is_typing": payload["is_typing"],
+                },
+            )
+
+    @staticmethod
+    def _normalize_error(exc: ValidationError) -> str:
+        detail = getattr(exc, "detail", None)
+        if isinstance(detail, dict):
+            first_value = next(iter(detail.values()), "请求参数非法")
+            if isinstance(first_value, (list, tuple)):
+                return str(first_value[0]) if first_value else "请求参数非法"
+            return str(first_value)
+        if isinstance(detail, (list, tuple)):
+            return str(detail[0]) if detail else "请求参数非法"
+        return str(detail or exc)
+
     async def disconnect(self, code):
         """处理 WebSocket 断开连接"""
         if hasattr(self, "user_group_name"):
@@ -49,6 +188,18 @@ class GlobalWebSocketConsumer(AsyncJsonWebsocketConsumer):
         # 心跳 ping/pong
         if message_type == "ping":
             await self.send_json({"type": "pong", "timestamp": content.get("timestamp")})
+            return
+
+        if message_type == "chat_send_message":
+            await self._handle_chat_send_message(content)
+            return
+
+        if message_type == "chat_mark_read":
+            await self._handle_chat_mark_read(content)
+            return
+
+        if message_type == "chat_typing":
+            await self._handle_chat_typing(content)
             return
 
         # 订阅上传任务进度

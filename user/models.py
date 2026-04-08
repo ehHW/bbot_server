@@ -108,3 +108,29 @@ class AuditLog(SoftDeleteModel):
 	def __str__(self) -> str:
 		actor_name = self.actor.username if self.actor else "anonymous"
 		return f"{actor_name}:{self.action}:{self.target_type}:{self.status}"
+
+
+class UserPreference(models.Model):
+	theme_mode = models.CharField(max_length=20, default="light", verbose_name="主题模式")
+	chat_receive_notification = models.BooleanField(default=True, verbose_name="接收聊天通知")
+	chat_list_sort_mode = models.CharField(max_length=20, default="recent", verbose_name="聊天列表排序模式")
+	chat_stealth_inspect_enabled = models.BooleanField(default=False, verbose_name="超级管理员隐身巡检开关")
+	settings_json = models.JSONField(blank=True, default=dict, verbose_name="扩展设置")
+	created_at = models.DateTimeField(default=timezone.now, editable=False)
+	updated_at = models.DateTimeField(auto_now=True)
+	user = models.OneToOneField(
+		"user.User",
+		on_delete=models.CASCADE,
+		related_name="preference",
+		verbose_name="用户",
+	)
+
+	class Meta:
+		db_table = "user_preference"
+		ordering = ["id"]
+		indexes = [
+			models.Index(fields=["chat_stealth_inspect_enabled"]),
+		]
+
+	def __str__(self) -> str:
+		return f"Preference<{self.user_id}>"

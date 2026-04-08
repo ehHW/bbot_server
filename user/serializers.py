@@ -2,7 +2,16 @@ from django.contrib.auth import authenticate
 from django.conf import settings
 from rest_framework import serializers
 
-from user.models import Permission, Role, User
+from user.models import Permission, Role, User, UserPreference
+
+
+SUPER_ADMIN_ONLY_PERMISSION_CODES = {"chat.review_all_messages"}
+
+
+def _filter_permission_queryset_for_request(queryset, request):
+    if request and request.user and request.user.is_authenticated and request.user.is_superuser:
+        return queryset
+    return queryset.exclude(code__in=SUPER_ADMIN_ONLY_PERMISSION_CODES)
 
 
 class LoginSerializer(serializers.Serializer):
@@ -40,6 +49,8 @@ class RoleSerializer(serializers.ModelSerializer):
     def get_fields(self):
         fields = super().get_fields()
         instance = self.instance if isinstance(self.instance, Role) else None
+        request = self.context.get("request")
+        fields["permission_ids"].queryset = _filter_permission_queryset_for_request(Permission.objects.all(), request)
         if instance and instance.is_super_admin_role():
             for field_name in ["name", "description", "permission_ids"]:
                 fields[field_name].read_only = True
@@ -179,3 +190,34 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, key, value)
         instance.save(update_fields=[*validated_data.keys(), "updated_at"])
         return instance
+
+
+class UserPreferenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserPreference
+        fields = [
+            "theme_mode",
+            "chat_receive_notification",
+            "chat_list_sort_mode",
+            "chat_stealth_inspect_enabled",
+            "settings_json",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def validate_theme_mode(self, value):
+        return "dark" if value == "dark" else "light"
+
+    def validate_chat_list_sort_mode(self, value):
+        normalized = str(value or "recent").strip().lower()
+        return normalized if normalized in {"recent", "unread"} else "recent"
+
+    def validate_chat_stealth_inspect_enabled(self, value):
+        request = self.context.get("request")
+        if value and (not request or not request.user or not request.user.is_superuser):
+            raise serializers.ValidationError("仅超级管理员可开启隐身巡检")
+        return bool(value)
+
+    def validate_settings_json(self, value):
+        return value or {}
