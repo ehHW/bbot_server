@@ -13,12 +13,66 @@ from chat.domain.member_settings import get_member_preferences
 from chat.infrastructure.repositories import get_latest_visible_message
 from hyself.models import AssetReference
 from hyself.utils.upload import media_url
-from chat.models import ChatConversation, ChatConversationMember, ChatFriendRequest, ChatFriendship, ChatGroupConfig, ChatMessage, build_pair_key
+from chat.models import ChatConversation, ChatConversationMember, ChatFriendRequest, ChatFriendship, ChatGroupConfig, ChatMessage, ChatMessageVisibility, build_pair_key
 
 
-def serialize_message(message: ChatMessage) -> dict:
+def _format_direct_participant_label(user) -> str:
+    username = str(getattr(user, "username", "") or "")
+    display_name = str(getattr(user, "display_name", "") or "").strip()
+    if display_name and display_name != username:
+        return f"{username}({display_name})"
+    return username or display_name or "未知用户"
+
+
+def _serialize_direct_conversation_identity(conversation: ChatConversation, viewer_user) -> tuple[str, str, dict | None]:
+    active_members = list(
+        ChatConversationMember.objects.select_related("user")
+        .filter(conversation=conversation, status=ChatConversationMember.Status.ACTIVE)
+        .order_by("id", "user_id")
+    )
+    if not active_members:
+        return conversation.name or "私聊会话", conversation.avatar or "", None
+
+    if viewer_user is not None:
+        other_member = next((item for item in active_members if item.user_id != viewer_user.id), None)
+        if other_member is not None:
+            target_user = other_member.user
+            return (
+                target_user.display_name or target_user.username,
+                target_user.avatar or "",
+                user_brief(target_user),
+            )
+
+    participants = [member.user for member in active_members]
+    title = "和".join(_format_direct_participant_label(item) for item in participants[:2])
+    if len(participants) == 1:
+        title = _format_direct_participant_label(participants[0])
+    if title:
+        title = f"{title}的私聊会话"
+    avatar = next((item.avatar for item in participants if item.avatar), "")
+    return title or conversation.name or "私聊会话", avatar, None
+
+
+def _sanitize_revoked_payload(payload: dict) -> dict:
+    revoked = payload.get("revoked")
+    if not isinstance(revoked, dict):
+        return {}
+    return {
+        "revoked": {
+            "revoked_at": revoked.get("revoked_at"),
+            "revoked_by_user_id": revoked.get("revoked_by_user_id"),
+            "can_restore_once": bool(revoked.get("can_restore_once")),
+            "restore_used": bool(revoked.get("restore_used")),
+        },
+    }
+
+
+def serialize_message(message: ChatMessage, *, include_deleted_metadata: bool = False) -> dict:
     payload = dict(message.payload or {})
-    if message.message_type in {ChatMessage.MessageType.IMAGE, ChatMessage.MessageType.FILE}:
+    message_is_revoked = is_message_revoked(message)
+    if message_is_revoked:
+        payload = _sanitize_revoked_payload(payload)
+    elif message.message_type in {ChatMessage.MessageType.IMAGE, ChatMessage.MessageType.FILE}:
         asset_reference_id = payload.get("source_asset_reference_id") or payload.get("asset_reference_id")
         if isinstance(asset_reference_id, int):
             reference = AssetReference.objects.select_related("asset").filter(id=asset_reference_id, deleted_at__isnull=True).first()
@@ -35,12 +89,18 @@ def serialize_message(message: ChatMessage) -> dict:
         reply_message = ChatMessage.objects.filter(id=reply_payload["id"]).first()
         if reply_message is not None and is_message_revoked(reply_message):
             payload["reply_to_message"] = build_reply_payload_from_message(reply_message)
+    if include_deleted_metadata:
+        deleted_entry = ChatMessageVisibility.objects.filter(message_id=message.id).order_by("-created_at", "-id").first()
+        if deleted_entry is not None:
+            payload["deleted"] = {
+                "deleted_at": to_serializable_datetime(deleted_entry.created_at),
+            }
     return {
         "id": message.id,
         "sequence": message.sequence,
         "client_message_id": message.client_message_id,
         "message_type": message.message_type,
-        "content": message.content,
+        "content": "" if message_is_revoked else message.content,
         "payload": payload,
         "is_system": message.is_system,
         "sender": None if message.sender is None else user_brief(message.sender),
@@ -68,13 +128,13 @@ def serialize_conversation(conversation: ChatConversation, user) -> dict:
     avatar = conversation.avatar
     direct_target = None
     friend_remark = None
-    if conversation.type == ChatConversation.Type.DIRECT and member:
-        other_member = ChatConversationMember.objects.select_related("user").filter(conversation=conversation, status=ChatConversationMember.Status.ACTIVE).exclude(user_id=user.id).first()
-        if other_member:
-            display_name = other_member.user.display_name or other_member.user.username
-            avatar = other_member.user.avatar
-            direct_target = user_brief(other_member.user)
-            friendship = get_active_friendship_between(user.id, other_member.user_id) or ChatFriendship.objects.filter(pair_key=build_pair_key(user.id, other_member.user_id)).first()
+    if conversation.type == ChatConversation.Type.DIRECT:
+        display_name, avatar, direct_target = _serialize_direct_conversation_identity(
+            conversation,
+            user if member is not None else None,
+        )
+        if member and direct_target is not None:
+            friendship = get_active_friendship_between(user.id, direct_target["id"]) or ChatFriendship.objects.filter(pair_key=build_pair_key(user.id, direct_target["id"])).first()
             friend_remark = friendship_remark(friendship, user.id) or None
     latest_visible_message = get_latest_visible_message(
         conversation,

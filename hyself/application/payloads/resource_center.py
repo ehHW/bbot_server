@@ -17,7 +17,7 @@ def _remaining_days(expires_at):
     return max(0, (expires_at.date() - timezone.now().date()).days)
 
 
-def file_item_payload(item: UploadedFile, *, entry_is_within_recycle_bin_tree) -> dict:
+def build_uploaded_file_payload(item: UploadedFile, *, entry_is_within_recycle_bin_tree) -> dict:
     asset, asset_reference = ensure_asset_compat_for_uploaded_file(item)
     expires_at = item.recycled_at + timedelta(days=RECYCLE_BIN_EXPIRE_DAYS) if item.recycled_at else None
     return {
@@ -50,7 +50,7 @@ def file_item_payload(item: UploadedFile, *, entry_is_within_recycle_bin_tree) -
     }
 
 
-def file_reference_payload(reference: AssetReference, *, entry_is_within_recycle_bin_tree) -> dict:
+def build_resource_reference_payload(reference: AssetReference, *, entry_is_within_recycle_bin_tree) -> dict:
     legacy_item = reference.legacy_uploaded_file
     is_dir = reference.ref_type == AssetReference.RefType.DIRECTORY
     expires_at = reference.recycled_at + timedelta(days=RECYCLE_BIN_EXPIRE_DAYS) if reference.recycled_at else None
@@ -98,7 +98,7 @@ def file_reference_payload(reference: AssetReference, *, entry_is_within_recycle
     }
 
 
-def build_system_search_entry_payload(entry: UploadedFile, *, entry_is_within_recycle_bin_tree) -> dict:
+def build_system_search_uploaded_file_payload(entry: UploadedFile, *, entry_is_within_recycle_bin_tree) -> dict:
     owner_name = (entry.created_by.display_name or entry.created_by.username) if entry.created_by is not None else "未知用户"
     chain: list[str] = []
     cursor = entry.parent
@@ -108,20 +108,20 @@ def build_system_search_entry_payload(entry: UploadedFile, *, entry_is_within_re
     chain.reverse()
     directory_path = "/".join(chain)
     full_path = f"{owner_name}/{directory_path}/{entry.display_name}" if directory_path else f"{owner_name}/{entry.display_name}"
-    payload = file_item_payload(entry, entry_is_within_recycle_bin_tree=entry_is_within_recycle_bin_tree)
+    payload = build_uploaded_file_payload(entry, entry_is_within_recycle_bin_tree=entry_is_within_recycle_bin_tree)
     payload["directory_path"] = directory_path
     payload["full_path"] = full_path
     return payload
 
 
-def build_reference_search_payload(reference: AssetReference, *, directory_path: str, entry_is_within_recycle_bin_tree) -> dict:
-    payload = file_reference_payload(reference, entry_is_within_recycle_bin_tree=entry_is_within_recycle_bin_tree)
+def build_reference_search_result_payload(reference: AssetReference, *, directory_path: str, entry_is_within_recycle_bin_tree) -> dict:
+    payload = build_resource_reference_payload(reference, entry_is_within_recycle_bin_tree=entry_is_within_recycle_bin_tree)
     payload["directory_path"] = directory_path
     payload["full_path"] = f"{directory_path}/{reference.display_name}" if directory_path else reference.display_name
     return payload
 
 
-def build_avatar_upload_payload(*, display_name: str, stored_name: str, relative_path: str, file_size: int, asset, asset_reference) -> dict:
+def build_avatar_upload_response_payload(*, display_name: str, stored_name: str, relative_path: str, file_size: int, asset, asset_reference) -> dict:
     return {
         "mode": "direct",
         "file": {

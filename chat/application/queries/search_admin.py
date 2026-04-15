@@ -129,6 +129,7 @@ def execute_admin_conversation_list_query(user, params: AdminConversationListQue
 def execute_admin_message_list_query(user, params: AdminMessageListQueryParams) -> dict:
     if not user_can_review_all_messages(user):
         raise PermissionDenied("当前无权查看全部聊天记录")
+    include_deleted_metadata = user_can_stealth_inspect(user)
     queryset = list_admin_messages(conversation_id=params.conversation_id, keyword=params.keyword, limit=200)
-    items = [serialize_message(item) | {"conversation_id": item.conversation_id} for item in queryset]
+    items = [serialize_message(item, include_deleted_metadata=include_deleted_metadata) | {"conversation_id": item.conversation_id} for item in queryset]
     return {"count": len(items), "next": None, "previous": None, "results": items}

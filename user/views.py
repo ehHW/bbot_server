@@ -8,7 +8,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
 from django.db.models import Count, Q
 
-from user.access_context import build_permission_context_payload, ensure_default_user_role, ensure_user_has_minimum_role
+from user.access_context import build_session_context_payload, ensure_default_user_role, ensure_user_has_minimum_role
 from user.models import Permission, Role, User, SUPER_ADMIN_ROLE_NAME
 from user.auth.permissions import ActionPermission
 from user.signals import ensure_default_permissions_synced
@@ -154,7 +154,7 @@ def permission_context_view(request):
 	ensure_super_admin_role()
 	ensure_default_role()
 	ensure_user_has_minimum_role(request.user)
-	return Response(build_permission_context_payload(request.user))
+	return Response(build_session_context_payload(request.user))
 
 
 @api_view(["POST"])

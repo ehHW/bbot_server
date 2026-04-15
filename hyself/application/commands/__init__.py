@@ -1,0 +1,1 @@
+"""Resource-center command package."""

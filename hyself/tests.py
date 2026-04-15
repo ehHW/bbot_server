@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
@@ -74,6 +75,17 @@ class UploadRecycleRestoreTests(APITestCase):
 			file_md5="",
 		)
 
+	def _assert_resource_event_published(self, publish_user_event, expected_event: str, *, recipient_user_id: int | None = None):
+		matching_calls = [
+			call
+			for call in publish_user_event.call_args_list
+			if call.args[1] == expected_event and (recipient_user_id is None or call.args[0] == recipient_user_id)
+		]
+		self.assertTrue(matching_calls, f"未找到事件 {expected_event} 的发布记录")
+		for call in matching_calls:
+			self.assertEqual(call.kwargs["domain"], "resource")
+		return matching_calls[0]
+
 	def test_small_upload_restores_same_md5_from_recycle_bin(self):
 		target_folder = self._create_folder("target-folder")
 		original = self._upload_small_file("server_log.txt", b"same-file-content")
@@ -98,6 +110,19 @@ class UploadRecycleRestoreTests(APITestCase):
 		self.assertEqual(recycled.parent_id, target_folder.id)
 		self.assertEqual(UploadedFile.objects.filter(created_by=self.user, file_md5=recycled.file_md5, is_dir=False).count(), 1)
 		self.assertTrue(AssetReference.objects.filter(legacy_uploaded_file_id=original_id).exists())
+
+	def test_create_folder_endpoint_returns_directory_payload(self):
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/folders/", {"name": "api-folder"}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+		body = response.json()
+		self.assertTrue(body["is_dir"])
+		self.assertEqual(body["display_name"], "api-folder")
+		self.assertEqual(body["resource_kind"], "resource_center")
+		self.assertTrue(UploadedFile.objects.filter(created_by=self.user, display_name="api-folder", is_dir=True).exists())
+		call = self._assert_resource_event_published(publish_user_event, "resource.entry.created", recipient_user_id=self.user.id)
+		self.assertEqual(call.args[0], self.user.id)
 
 	def test_precheck_restores_same_md5_from_recycle_bin(self):
 		target_folder = self._create_folder("precheck-target")
@@ -133,6 +158,99 @@ class UploadRecycleRestoreTests(APITestCase):
 		file_record.refresh_from_db()
 		self.assertIsNone(file_record.recycled_at)
 		self.assertEqual(file_record.parent_id, target_folder.id)
+
+	def test_rename_resource_entry_publishes_updated_event(self):
+		upload_response = self._upload_small_file("rename-before.txt", b"rename-content")
+		entry_id = upload_response["file"]["id"]
+
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/rename/", {"id": entry_id, "name": "rename-after.txt"}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		call = self._assert_resource_event_published(publish_user_event, "resource.entry.updated", recipient_user_id=self.user.id)
+		payload = call.args[2]
+		self.assertEqual(payload["entry"]["id"], entry_id)
+		self.assertEqual(payload["entry"]["display_name"], "rename-after.txt")
+		self.assertEqual(payload["entry"]["resource_kind"], "resource_center")
+
+	def test_restore_resource_entry_publishes_moved_event(self):
+		target_folder = self._create_folder("restore-target")
+		upload_response = self._upload_small_file_to_parent("restore-me.txt", b"restore-content", parent_id=target_folder.id)
+		entry_id = upload_response["file"]["id"]
+		self.client.post("/api/upload/delete/", {"id": entry_id}, format="json")
+
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/recycle-bin/restore/", {"id": entry_id}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		call = self._assert_resource_event_published(publish_user_event, "resource.entry.moved", recipient_user_id=self.user.id)
+		payload = call.args[2]
+		self.assertEqual(payload["entry_id"], entry_id)
+		self.assertEqual(payload["to_parent_id"], target_folder.id)
+		self.assertEqual(payload["entry"]["id"], entry_id)
+
+	def test_precheck_restore_publishes_moved_event(self):
+		target_folder = self._create_folder("precheck-moved-target")
+		upload_response = self._upload_small_file("recycle-moved.log", b"moved-content")
+		entry_id = upload_response["file"]["id"]
+		file_record = UploadedFile.objects.get(id=entry_id)
+		self.client.post("/api/upload/delete/", {"id": entry_id}, format="json")
+		file_path = get_upload_root() / Path(file_record.relative_path)
+		file_md5 = calc_file_md5(file_path)
+
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post(
+				"/api/upload/precheck/",
+				{
+					"file_md5": file_md5,
+					"file_name": "recycle-moved.log",
+					"file_size": len(b"moved-content"),
+					"parent_id": target_folder.id,
+				},
+				format="json",
+			)
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		call = self._assert_resource_event_published(publish_user_event, "resource.entry.moved", recipient_user_id=self.user.id)
+		payload = call.args[2]
+		self.assertEqual(payload["entry_id"], entry_id)
+		self.assertEqual(payload["to_parent_id"], target_folder.id)
+		self.assertEqual(payload["entry"]["id"], entry_id)
+
+	def test_resource_events_are_also_broadcast_to_superusers(self):
+		super_admin = User.objects.create_superuser(username="resource_super", password="Test123456")
+
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/folders/", {"name": "super-visible-folder"}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+		self._assert_resource_event_published(publish_user_event, "resource.entry.created", recipient_user_id=self.user.id)
+		self._assert_resource_event_published(publish_user_event, "resource.entry.created", recipient_user_id=super_admin.id)
+
+	def test_delete_event_marks_when_owner_has_no_entries_left(self):
+		entry = UploadedFile.objects.create(
+			created_by=self.user,
+			parent=None,
+			is_dir=False,
+			display_name="last-file.txt",
+			stored_name="last-file.txt",
+			relative_path=join_relative_path(get_user_relative_root(self.user), "last-file.txt"),
+			file_size=12,
+			file_md5="2" * 32,
+		)
+
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/delete/", {"id": entry.id, "scope": "system"}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+		self.user.is_superuser = True
+		self.user.save(update_fields=["is_superuser"])
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/delete/", {"id": entry.id, "scope": "system"}, format="json")
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		call = self._assert_resource_event_published(publish_user_event, "resource.entry.deleted", recipient_user_id=self.user.id)
+		self.assertFalse(call.args[2]["owner_has_entries"])
 
 	def test_small_upload_instant_reuses_global_same_md5_file(self):
 		other_user = User.objects.create_user(username="global_owner", password="Test123456")
@@ -236,9 +354,11 @@ class UploadRecycleRestoreTests(APITestCase):
 		ensure_asset_reference_for_uploaded_file(folder)
 		ensure_asset_reference_for_uploaded_file(file_entry)
 
-		response = self.client.post("/api/upload/delete/", {"id": folder.id}, format="json")
+		with patch("hyself.infrastructure.event_bus.publish_user_event") as publish_user_event:
+			response = self.client.post("/api/upload/delete/", {"id": folder.id}, format="json")
 
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		self._assert_resource_event_published(publish_user_event, "resource.entry.deleted", recipient_user_id=self.user.id)
 		root_listing = self.client.get("/api/upload/files/")
 		self.assertEqual(root_listing.status_code, status.HTTP_200_OK)
 		root_names = [item["display_name"] for item in root_listing.json()["items"]]

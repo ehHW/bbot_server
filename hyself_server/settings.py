@@ -8,6 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 env = environ.Env(
     DEBUG=(bool, False),
     SECRET_KEY=(str, ""),
+    SYSTEM_TITLE=(str, "Hyself 管理后台"),
     ALLOWED_HOSTS=(list, []),
     CORS_ALLOW_ALL_ORIGINS=(bool, True),
     CORS_ALLOW_CREDENTIALS=(bool, False),
@@ -25,6 +26,7 @@ environ.Env.read_env(BASE_DIR / ".env")
 
 SECRET_KEY = env("SECRET_KEY")
 DEBUG = env("DEBUG")
+SYSTEM_TITLE = env("SYSTEM_TITLE")
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["127.0.0.1", "localhost", "testserver"])
 
 INSTALLED_APPS = [

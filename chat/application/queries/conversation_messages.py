@@ -67,5 +67,5 @@ def execute_conversation_messages_query(user, conversation_id: int, params: Conv
             "has_more_before": has_more_before,
             "has_more_after": has_more_after,
         },
-        "items": [serialize_message(item) for item in messages],
+        "items": [serialize_message(item, include_deleted_metadata=include_hidden_messages) for item in messages],
     }

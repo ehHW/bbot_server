@@ -17,9 +17,12 @@ from hyself.models import AssetReference, UploadedFile
 from hyself_server.asgi import application
 from hyself.tasks import merge_large_file_task
 from chat.application.commands import execute_disband_group_conversation_command, execute_leave_group_conversation_command, execute_mute_group_member_command, execute_remove_group_member_command, execute_transfer_group_owner_command
+from chat.application.commands.delivery import build_message_delivery_payloads
 from chat.application.commands.friendships import execute_submit_friend_request_command
 from chat.domain.access import get_conversation_access
-from chat.models import ChatConversation, ChatConversationMember, ChatMessage
+from chat.domain.preferences import get_or_create_user_preference
+from chat.domain.serialization import serialize_conversation
+from chat.models import ChatConversation, ChatConversationMember, ChatMessage, ChatMessageVisibility
 from chat.models import ChatFriendship, ChatGroupConfig, ChatGroupJoinRequest, build_pair_key
 from user.models import Permission, Role, User
 from hyself.utils.upload import get_temp_root
@@ -301,6 +304,142 @@ class ChatAttachmentMessageTests(TestCase):
 		})
 		member.refresh_from_db()
 		self.assertTrue(member.show_in_list)
+
+	def test_conversation_messages_api_marks_deleted_items_for_stealth_inspect(self):
+		self._create_active_friendship()
+		self.user.is_superuser = True
+		self.user.save(update_fields=["is_superuser"])
+		preference = get_or_create_user_preference(self.user)
+		preference.chat_stealth_inspect_enabled = True
+		preference.save(update_fields=["chat_stealth_inspect_enabled", "updated_at"])
+		message = ChatMessage.objects.create(
+			conversation=self.conversation,
+			sender=self.friend,
+			message_type=ChatMessage.MessageType.TEXT,
+			content="deleted for viewer",
+			sequence=2,
+		)
+		ChatMessageVisibility.objects.create(message=message, user=self.user)
+
+		response = self.client.get(f"/api/chat/conversations/{self.conversation.id}/messages/")
+
+		self.assertEqual(response.status_code, 200)
+		body = response.json()
+		self.assertEqual(len(body["items"]), 1)
+		self.assertEqual(body["items"][0]["content"], "deleted for viewer")
+		self.assertIn("deleted", body["items"][0]["payload"])
+		self.assertTrue(body["items"][0]["payload"]["deleted"]["deleted_at"])
+
+	def test_stealth_direct_conversation_has_pair_title_and_avatar(self):
+		self.user.is_superuser = True
+		self.user.save(update_fields=["is_superuser"])
+		preference = get_or_create_user_preference(self.user)
+		preference.chat_stealth_inspect_enabled = True
+		preference.save(update_fields=["chat_stealth_inspect_enabled", "updated_at"])
+		self.friend.display_name = "好友甲"
+		self.friend.avatar = "/media/friend-a.png"
+		self.friend.save(update_fields=["display_name", "avatar"])
+		self.third_user.display_name = "好友乙"
+		self.third_user.save(update_fields=["display_name"])
+		ChatConversationMember.objects.filter(conversation=self.conversation).delete()
+		ChatConversationMember.objects.create(
+			conversation=self.conversation,
+			user=self.friend,
+			status=ChatConversationMember.Status.ACTIVE,
+			role=ChatConversationMember.Role.MEMBER,
+			show_in_list=True,
+		)
+		ChatConversationMember.objects.create(
+			conversation=self.conversation,
+			user=self.third_user,
+			status=ChatConversationMember.Status.ACTIVE,
+			role=ChatConversationMember.Role.MEMBER,
+			show_in_list=True,
+		)
+
+		payload = serialize_conversation(self.conversation, self.user)
+
+		self.assertEqual(payload["name"], "chat_receiver(好友甲)和chat_third(好友乙)的私聊会话")
+		self.assertEqual(payload["avatar"], "/media/friend-a.png")
+		self.assertIsNone(payload["direct_target"])
+		self.assertEqual(payload["access_mode"], "stealth_readonly")
+
+	def test_build_message_delivery_payloads_includes_stealth_inspector(self):
+		self._create_active_friendship()
+		inspector = User.objects.create_superuser(username="stealth_admin", password="Test123456")
+		preference = get_or_create_user_preference(inspector)
+		preference.chat_stealth_inspect_enabled = True
+		preference.save(update_fields=["chat_stealth_inspect_enabled", "updated_at"])
+		message = ChatMessage.objects.create(
+			conversation=self.conversation,
+			sender=self.user,
+			message_type=ChatMessage.MessageType.TEXT,
+			content="hello inspector",
+			sequence=5,
+		)
+
+		_, _, _, recipient_payloads = build_message_delivery_payloads(
+			conversation=self.conversation,
+			sender_user=self.user,
+			message=message,
+		)
+
+		self.assertEqual({item["user_id"] for item in recipient_payloads}, {self.friend.id, inspector.id})
+		inspector_payload = next(item for item in recipient_payloads if item["user_id"] == inspector.id)
+		self.assertEqual(inspector_payload["conversation"]["access_mode"], "stealth_readonly")
+		self.assertEqual(inspector_payload["unread_count"], 0)
+
+	def test_build_message_delivery_payloads_skips_disabled_stealth_inspector(self):
+		self._create_active_friendship()
+		inspector = User.objects.create_superuser(username="stealth_admin_off", password="Test123456")
+		preference = get_or_create_user_preference(inspector)
+		preference.chat_stealth_inspect_enabled = False
+		preference.save(update_fields=["chat_stealth_inspect_enabled", "updated_at"])
+		message = ChatMessage.objects.create(
+			conversation=self.conversation,
+			sender=self.user,
+			message_type=ChatMessage.MessageType.TEXT,
+			content="hello members only",
+			sequence=6,
+		)
+
+		_, _, _, recipient_payloads = build_message_delivery_payloads(
+			conversation=self.conversation,
+			sender_user=self.user,
+			message=message,
+		)
+
+		self.assertEqual({item["user_id"] for item in recipient_payloads}, {self.friend.id})
+
+	def test_revoked_message_history_hides_original_content_and_snapshot(self):
+		self._create_active_friendship()
+		message = ChatMessage.objects.create(
+			conversation=self.conversation,
+			sender=self.user,
+			message_type=ChatMessage.MessageType.TEXT,
+			content="secret draft",
+			sequence=3,
+		)
+
+		revoke_response = self.client.post(
+			f"/api/chat/messages/{message.id}/revoke/",
+			format="json",
+		)
+
+		self.assertEqual(revoke_response.status_code, 200)
+		revoked_message = revoke_response.json()["message"]
+		self.assertEqual(revoked_message["content"], "")
+		self.assertIn("revoked", revoked_message["payload"])
+		self.assertNotIn("original_message", revoked_message["payload"]["revoked"])
+
+		response = self.client.get(f"/api/chat/conversations/{self.conversation.id}/messages/")
+
+		self.assertEqual(response.status_code, 200)
+		body = response.json()
+		self.assertEqual(len(body["items"]), 1)
+		self.assertEqual(body["items"][0]["content"], "")
+		self.assertIn("revoked", body["items"][0]["payload"])
+		self.assertNotIn("original_message", body["items"][0]["payload"]["revoked"])
 
 	def test_discover_search_returns_group_results_for_non_members(self):
 		response = self.client.get(

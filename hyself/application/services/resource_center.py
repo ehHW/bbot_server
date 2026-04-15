@@ -198,17 +198,18 @@ def materialize_existing_upload_file(
     display_name: str,
     *,
     business: str = "",
-) -> tuple[UploadedFile, bool]:
+) -> tuple[UploadedFile, bool, int | None]:
     target_existing = get_active_target_file(user, target_parent, display_name)
     if target_existing:
         if target_existing.file_md5 == existing.file_md5:
             if target_existing.business != business:
                 target_existing.business = business
                 target_existing.save(update_fields=["business", "updated_at"])
-            return target_existing, False
+            return target_existing, False, None
         raise ValidationError({"detail": "目标目录已存在同名文件，但内容不同，请先重命名或删除原文件"})
 
     if existing.recycled_at is not None:
+        previous_parent_id = existing.parent_id
         relocate_recycled_file_to_target(user, existing, target_parent, display_name)
         existing.parent = target_parent
         existing.display_name = display_name
@@ -216,13 +217,13 @@ def materialize_existing_upload_file(
         existing.recycled_at = None
         existing.recycle_original_parent = None
         existing.save(update_fields=["parent", "display_name", "stored_name", "relative_path", "business", "recycled_at", "recycle_original_parent", "updated_at"])
-        return existing, True
+        return existing, True, previous_parent_id
 
     if existing.created_by_id == user.id and existing.parent_id == (target_parent.id if target_parent else None) and existing.display_name == display_name:
         if existing.business != business:
             existing.business = business
             existing.save(update_fields=["business", "updated_at"])
-        return existing, False
+        return existing, False, None
 
     duplicated = UploadedFile.objects.create(
         created_by=user,
@@ -235,7 +236,7 @@ def materialize_existing_upload_file(
         file_size=existing.file_size,
         relative_path=existing.relative_path,
     )
-    return duplicated, False
+    return duplicated, False, None
 
 
 def resolve_existing_upload_file(
@@ -246,7 +247,7 @@ def resolve_existing_upload_file(
     *,
     relative_path: str = "",
     business: str = "",
-) -> tuple[UploadedFile | None, bool]:
+) -> tuple[UploadedFile | None, bool, int | None]:
     normalized_relative_path = normalize_relative_path(relative_path)
     existing = None
 
@@ -289,7 +290,7 @@ def resolve_existing_upload_file(
             ).order_by("-recycled_at", "-id").first()
 
     if not existing:
-        return None, False
+        return None, False, None
 
     return materialize_existing_upload_file(user, existing, target_parent, display_name, business=business)
 

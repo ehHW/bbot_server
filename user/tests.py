@@ -4,6 +4,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from chat.domain.preferences import get_or_create_user_preference
 from user.models import Permission, Role, User
 from user.signals import DEFAULT_USER_ROLE_NAME, ensure_default_permissions_synced
 
@@ -223,3 +224,27 @@ class CorePermissionOperationTests(APITestCase):
 
 		self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 		self.assertEqual(response.data.get("detail"), "核心权限仅超级管理员可操作")
+
+
+class PermissionContextBootstrapTests(APITestCase):
+	def setUp(self):
+		self.permission, _ = Permission.objects.get_or_create(code="chat.view_conversation", defaults={"name": "查看会话"})
+		self.role, _ = Role.objects.get_or_create(name="初始化协议角色", defaults={"description": "用于测试初始化协议"})
+		self.role.permissions.set([self.permission])
+		self.user = User.objects.create_user(username="bootstrap_user", password="123456")
+		self.user.roles.add(self.role)
+		preference = get_or_create_user_preference(self.user)
+		preference.chat_list_sort_mode = "unread"
+		preference.save(update_fields=["chat_list_sort_mode", "updated_at"])
+
+	def test_permission_context_returns_full_session_bootstrap_payload(self):
+		self.client.force_authenticate(user=self.user)
+
+		response = self.client.get(reverse("permission_context"))
+
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		self.assertIn("chat.view_conversation", response.data["permission_codes"])
+		self.assertIn("chat_center", response.data["visible_menu_keys"])
+		self.assertEqual(response.data["system"]["system_title"], "Hyself 管理后台")
+		self.assertEqual(response.data["chat"]["chat_list_sort_mode"], "unread")
+		self.assertIn("settings_json", response.data["chat"])
