@@ -22,6 +22,7 @@ env/
 .env
 .env.*
 !.env.example
+!.env.docker.example
 
 # Django
 *.log
@@ -54,4 +55,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-nginx.conf
+nginx*
