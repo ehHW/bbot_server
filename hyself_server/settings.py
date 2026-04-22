@@ -146,7 +146,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
-MEDIA_URL = "/uploads/"
+MEDIA_URL = "/api1/uploads/"
 MEDIA_ROOT = BASE_DIR / "uploads"
 
 UPLOAD_SMALL_FILE_THRESHOLD = 100 * 1024 * 1024

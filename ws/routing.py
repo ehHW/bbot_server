@@ -6,5 +6,5 @@ from django.urls import path
 from ws.consumers import GlobalWebSocketConsumer
 
 websocket_urlpatterns = [
-    path("ws/global/", GlobalWebSocketConsumer.as_asgi()),
+    path("api1/ws/global/", GlobalWebSocketConsumer.as_asgi()),
 ]

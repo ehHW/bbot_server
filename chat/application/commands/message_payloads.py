@@ -33,6 +33,7 @@ class ChatAssetPayload(TypedDict):
     thumbnail_url: NotRequired[str]
     processing_status: NotRequired[str]
     subtitle_tracks: NotRequired[list[dict[str, object]]]
+    extra_metadata: NotRequired[dict[str, object]]
 
 
 class ChatRecordItemPayload(TypedDict):
@@ -100,7 +101,12 @@ def build_asset_payload(*, chat_reference: AssetReference, source_reference: Ass
     asset = source_reference.asset
     if asset is None:
         raise ValueError("source_reference.asset")
-    video_processing = ((asset.extra_metadata or {}).get("video_processing") if isinstance(asset.extra_metadata, dict) else None) or {}
+    asset_metadata = asset.extra_metadata if isinstance(asset.extra_metadata, dict) else {}
+    video_processing = (asset_metadata.get("video_processing") if isinstance(asset_metadata, dict) else None) or {}
+    audio_processing = (asset_metadata.get("audio_processing") if isinstance(asset_metadata, dict) else None) or {}
+    stream_url = str(video_processing.get("playlist_url") or audio_processing.get("stream_url") or "")
+    thumbnail_url = str(video_processing.get("thumbnail_url") or audio_processing.get("cover_url") or "")
+    processing_status = str(video_processing.get("status") or audio_processing.get("status") or "")
     return {
         "asset_reference_id": chat_reference.id,
         "source_asset_reference_id": source_reference.id,
@@ -109,10 +115,14 @@ def build_asset_payload(*, chat_reference: AssetReference, source_reference: Ass
         "mime_type": asset.mime_type,
         "file_size": asset.file_size,
         "url": media_url(asset.storage_key) if asset.storage_key and asset.storage_backend == asset.StorageBackend.LOCAL else "",
-        "stream_url": str(video_processing.get("playlist_url") or ""),
-        "thumbnail_url": str(video_processing.get("thumbnail_url") or ""),
-        "processing_status": str(video_processing.get("status") or ""),
+        "stream_url": stream_url,
+        "thumbnail_url": thumbnail_url,
+        "processing_status": processing_status,
         "subtitle_tracks": video_processing.get("subtitle_tracks") or [],
+        "extra_metadata": {
+            "video_processing": video_processing,
+            "audio_processing": audio_processing,
+        },
     }
 
 

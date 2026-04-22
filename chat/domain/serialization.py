@@ -78,12 +78,18 @@ def serialize_message(message: ChatMessage, *, include_deleted_metadata: bool = 
             reference = AssetReference.objects.select_related("asset").filter(id=asset_reference_id, deleted_at__isnull=True).first()
             asset = None if reference is None else reference.asset
             if asset is not None:
-                video_processing = ((asset.extra_metadata or {}).get("video_processing") if isinstance(asset.extra_metadata, dict) else None) or {}
-                payload["url"] = payload.get("url") or (media_url(asset.storage_key) if asset.storage_key and asset.storage_backend == asset.StorageBackend.LOCAL else "")
-                payload["stream_url"] = str(video_processing.get("playlist_url") or payload.get("stream_url") or "")
-                payload["thumbnail_url"] = str(video_processing.get("thumbnail_url") or payload.get("thumbnail_url") or "")
-                payload["processing_status"] = str(video_processing.get("status") or payload.get("processing_status") or "")
+                asset_metadata = asset.extra_metadata if isinstance(asset.extra_metadata, dict) else {}
+                video_processing = (asset_metadata.get("video_processing") if isinstance(asset_metadata, dict) else None) or {}
+                audio_processing = (asset_metadata.get("audio_processing") if isinstance(asset_metadata, dict) else None) or {}
+                payload["url"] = media_url(asset.storage_key) if asset.storage_key and asset.storage_backend == asset.StorageBackend.LOCAL else ""
+                payload["stream_url"] = str(video_processing.get("playlist_url") or audio_processing.get("stream_url") or payload.get("stream_url") or "")
+                payload["thumbnail_url"] = str(video_processing.get("thumbnail_url") or audio_processing.get("cover_url") or payload.get("thumbnail_url") or "")
+                payload["processing_status"] = str(video_processing.get("status") or audio_processing.get("status") or payload.get("processing_status") or "")
                 payload["subtitle_tracks"] = video_processing.get("subtitle_tracks") or payload.get("subtitle_tracks") or []
+                payload["extra_metadata"] = {
+                    "video_processing": video_processing,
+                    "audio_processing": audio_processing,
+                }
     reply_payload = payload.get("reply_to_message")
     if isinstance(reply_payload, dict) and isinstance(reply_payload.get("id"), int):
         reply_message = ChatMessage.objects.filter(id=reply_payload["id"]).first()

@@ -10,6 +10,7 @@ from hyself.auth.permissions import resolve_upload_permission_code
 from hyself.application.commands.resource_center import (
     delete_resource_entry,
     rename_resource_entry,
+    reset_system_resource_center,
     restore_resource_entry,
     save_chat_attachment_to_resource,
 )
@@ -239,6 +240,17 @@ class ClearRecycleBinAPIView(APIView):
     def post(self, request):
         ensure_request_permission(request, "file.manage_system_resource")
         return Response({"detail": "只有系统资源支持彻底删除"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ResetSystemResourceCenterAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ensure_request_permission(request, "file.manage_system_resource")
+        if not request.user.is_superuser:
+            return Response({"detail": "当前无权重置系统资源"}, status=status.HTTP_403_FORBIDDEN)
+        result = reset_system_resource_center(acting_user=request.user)
+        return Response(result)
 
 
 class UploadSmallFileAPIView(APIView):

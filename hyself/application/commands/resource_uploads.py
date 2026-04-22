@@ -5,6 +5,7 @@ from pathlib import Path
 from rest_framework.exceptions import ValidationError
 
 from hyself.asset_compat import create_user_profile_asset_reference, ensure_asset_compat_for_uploaded_file
+from hyself.audio_processing import ensure_audio_asset_pipeline
 from hyself.application.payloads.resource_center import (
     build_avatar_upload_response_payload,
     build_uploaded_file_payload,
@@ -148,6 +149,7 @@ def process_small_file_upload(*, user, file_obj, category: str, parent_id: int |
         business=category,
     )
     asset, _ = ensure_asset_compat_for_uploaded_file(file_record)
+    ensure_audio_asset_pipeline(asset)
     ensure_video_asset_pipeline(asset)
     notify_resource_entry_created(file_record)
 

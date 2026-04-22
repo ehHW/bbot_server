@@ -40,8 +40,8 @@ def hard_delete_uploaded_entry(entry: UploadedFile) -> dict:
     removed_db_files = sum(1 for item in items if not item.is_dir)
     removed_db_dirs = sum(1 for item in items if item.is_dir)
 
-    AssetReference.all_objects.filter(id__in=[item.id for item in asset_refs]).delete()
-    UploadedFile.all_objects.filter(id__in=subtree_ids).delete()
+    AssetReference.all_objects.filter(id__in=[item.id for item in asset_refs]).hard_delete()
+    UploadedFile.all_objects.filter(id__in=subtree_ids).hard_delete()
 
     removed_disk_files = 0
     for relative_path in file_paths:
@@ -57,9 +57,34 @@ def hard_delete_uploaded_entry(entry: UploadedFile) -> dict:
     for asset_id in asset_ids:
         if AssetReference.all_objects.filter(asset_id=asset_id).exists():
             continue
-        Asset.all_objects.filter(id=asset_id).delete()
+        Asset.all_objects.filter(id=asset_id).hard_delete()
 
     return {
+        "removed_db_files": removed_db_files,
+        "removed_db_dirs": removed_db_dirs,
+        "removed_disk_files": removed_disk_files,
+    }
+
+
+def reset_system_resource_center(*, acting_user) -> dict:
+    if not acting_user.is_superuser:
+        raise PermissionDenied("当前无权重置系统资源")
+
+    root_entries = list(
+        UploadedFile.all_objects.filter(parent_id__isnull=True).order_by("-is_dir", "-id")
+    )
+
+    removed_db_files = 0
+    removed_db_dirs = 0
+    removed_disk_files = 0
+    for entry in root_entries:
+        result = hard_delete_uploaded_entry(entry)
+        removed_db_files += int(result.get("removed_db_files", 0) or 0)
+        removed_db_dirs += int(result.get("removed_db_dirs", 0) or 0)
+        removed_disk_files += int(result.get("removed_disk_files", 0) or 0)
+
+    return {
+        "detail": "系统资源已归零",
         "removed_db_files": removed_db_files,
         "removed_db_dirs": removed_db_dirs,
         "removed_disk_files": removed_disk_files,

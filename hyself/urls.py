@@ -11,6 +11,7 @@ urlpatterns = [
     path("upload/recycle-bin/", views.RecycleBinEntriesAPIView.as_view(), name="upload_recycle_bin"),
     path("upload/recycle-bin/restore/", views.RestoreRecycleBinEntryAPIView.as_view(), name="upload_recycle_bin_restore"),
     path("upload/recycle-bin/clear/", views.ClearRecycleBinAPIView.as_view(), name="upload_recycle_bin_clear"),
+    path("upload/system-resource/reset/", views.ResetSystemResourceCenterAPIView.as_view(), name="upload_system_resource_reset"),
     path("upload/folders/", views.CreateFolderAPIView.as_view(), name="upload_folders"),
     path("upload/chat-attachments/save/", views.SaveChatAttachmentToResourceAPIView.as_view(), name="upload_chat_attachment_save"),
     path("upload/delete/", views.DeleteFileEntryAPIView.as_view(), name="upload_delete"),

@@ -6,6 +6,7 @@ from celery import shared_task
 from channels.layers import get_channel_layer
 
 from hyself.asset_compat import ensure_asset_compat_for_uploaded_file
+from hyself.audio_processing import ensure_audio_asset_pipeline, mark_audio_processing_status, transcode_audio_to_m4a
 from hyself.models import UploadedFile
 from hyself.video_processing import ensure_video_asset_pipeline, mark_video_processing_status, transcode_video_to_hls
 from hyself.utils.upload import (
@@ -138,6 +139,7 @@ def merge_large_file_task(
                 business=business,
             )
         asset, asset_reference = ensure_asset_compat_for_uploaded_file(file_record)
+        ensure_audio_asset_pipeline(asset)
         ensure_video_asset_pipeline(asset)
 
         result_payload = {
@@ -193,4 +195,24 @@ def process_video_asset_task(self, asset_id: int):
     except Exception as exc:
         if asset is not None:
             mark_video_processing_status(asset, status="failed", error=str(exc))
+        return {"status": "failed", "asset_id": asset_id, "error": str(exc)}
+
+
+@shared_task(bind=True)
+def process_audio_asset_task(self, asset_id: int):
+    asset = None
+    try:
+        from hyself.models import Asset as AssetModel
+
+        asset = AssetModel.objects.filter(id=asset_id, deleted_at__isnull=True).first()
+        if asset is None:
+            return {"status": "missing", "asset_id": asset_id}
+
+        mark_audio_processing_status(asset, status="processing")
+        outputs = transcode_audio_to_m4a(asset)
+        mark_audio_processing_status(asset, status="ready", extra=outputs)
+        return {"status": "ready", "asset_id": asset.id, **outputs}
+    except Exception as exc:
+        if asset is not None:
+            mark_audio_processing_status(asset, status="failed", error=str(exc))
         return {"status": "failed", "asset_id": asset_id, "error": str(exc)}

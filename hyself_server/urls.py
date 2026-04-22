@@ -9,10 +9,10 @@ from django.urls import include, path
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("hyself/", include(("hyself.urls", "hyself"), namespace="hyself_web")),
-    path("api/chat/", include(("chat.urls", "chat"), namespace="chat_api")),
-    path("api/game/", include(("game.urls", "game"), namespace="game_api")),
-    path("api/", include("user.urls")),
-    path("api/", include(("hyself.urls", "hyself"), namespace="hyself_api")),
+    path("api1/chat/", include(("chat.urls", "chat"), namespace="chat_api")),
+    path("api1/game/", include(("game.urls", "game"), namespace="game_api")),
+    path("api1/", include("user.urls")),
+    path("api1/", include(("hyself.urls", "hyself"), namespace="hyself_api")),
 ]
 
 if settings.DEBUG:
