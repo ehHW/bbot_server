@@ -261,7 +261,7 @@ hyself_server/
 
 ## 相关文档
 
-- docs/implementation_notes/update-2026-04-24.md
+- docs/updates/update-2026-04-24.md
 
 ## 联调建议
 

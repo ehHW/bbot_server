@@ -39,7 +39,7 @@ services:
 
   # ── ASGI 后端（uvicorn） ─────────────────────────────────────
   backend:
-    image: hyself_server-backend:1.1.0
+    image: hyself_server-backend:1.1.1
     build:
       context: .
     container_name: hyself_backend
@@ -69,6 +69,8 @@ services:
       - run
       - uvicorn
       - hyself_server.asgi:application
+      - --lifespan
+      - "off"
       - --host
       - "0.0.0.0"
       - --port
@@ -78,7 +80,7 @@ services:
 
   # ── Celery Worker ────────────────────────────────────────────
   celery:
-    image: hyself_server-celery:1.1.0
+    image: hyself_server-celery:1.1.1
     build:
       context: .
     container_name: hyself_celery

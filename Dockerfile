@@ -33,4 +33,4 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认命令：启动 ASGI 服务（docker-compose 中 celery 服务会覆盖此命令）
 CMD ["uv", "run", "uvicorn", "hyself_server.asgi:application", \
-     "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+     "--lifespan", "off", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
