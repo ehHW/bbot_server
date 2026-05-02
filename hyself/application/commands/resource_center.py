@@ -35,29 +35,55 @@ def hard_delete_uploaded_entry(entry: UploadedFile) -> dict:
     items = list(UploadedFile.all_objects.filter(id__in=subtree_ids).order_by("-is_dir", "-id"))
     asset_refs = list(AssetReference.all_objects.select_related("asset").filter(legacy_uploaded_file_id__in=subtree_ids))
     asset_ids = {item.asset_id for item in asset_refs if item.asset_id}
+    # 收集每个 relative_path 对应的 asset_id，便于后续对照清理
+    path_to_asset_id: dict[str, int] = {}
+    for ref in asset_refs:
+        if ref.asset_id and ref.relative_path_cache:
+            path_to_asset_id[ref.relative_path_cache] = ref.asset_id
     file_paths = {str(item.relative_path or "") for item in items if not item.is_dir and item.relative_path}
 
     removed_db_files = sum(1 for item in items if not item.is_dir)
     removed_db_dirs = sum(1 for item in items if item.is_dir)
 
+    # 先删除本批次的 AssetReference 和 UploadedFile
     AssetReference.all_objects.filter(id__in=[item.id for item in asset_refs]).hard_delete()
     UploadedFile.all_objects.filter(id__in=subtree_ids).hard_delete()
 
+    # 同步删除同一 file_md5 的其他 UploadedFile 引用（同用户通过秒传复用产生的冗余条目）
+    md5_set = {str(item.file_md5 or "") for item in items if not item.is_dir and item.file_md5}
+    if md5_set:
+        dangling_entries = list(UploadedFile.all_objects.filter(file_md5__in=md5_set, is_dir=False).values_list("id", flat=True))
+        if dangling_entries:
+            AssetReference.all_objects.filter(legacy_uploaded_file_id__in=dangling_entries).hard_delete()
+            UploadedFile.all_objects.filter(id__in=dangling_entries).hard_delete()
+            removed_db_files += len(dangling_entries)
+
     removed_disk_files = 0
+    deleted_asset_ids: set[int] = set()
     for relative_path in file_paths:
+        # 物理文件是否还被其他条目或 Asset 引用
         still_used_by_entry = UploadedFile.all_objects.filter(relative_path=relative_path).exists()
-        still_used_by_asset = Asset.all_objects.filter(storage_key=relative_path).exclude(id__in=asset_ids).exists()
-        if still_used_by_entry or still_used_by_asset:
+        still_used_by_other_asset = Asset.all_objects.filter(storage_key=relative_path).exclude(id__in=asset_ids).exists()
+        if still_used_by_entry or still_used_by_other_asset:
             continue
         target_path = get_upload_root() / Path(relative_path)
         if target_path.exists() and target_path.is_file():
             target_path.unlink()
             removed_disk_files += 1
+        # 记录该路径对应的 asset_id，后续强制清理
+        matched_asset_id = path_to_asset_id.get(relative_path)
+        if matched_asset_id:
+            deleted_asset_ids.add(matched_asset_id)
 
     for asset_id in asset_ids:
-        if AssetReference.all_objects.filter(asset_id=asset_id).exists():
-            continue
-        Asset.all_objects.filter(id=asset_id).hard_delete()
+        if asset_id in deleted_asset_ids:
+            # 物理文件已被删除，强制清理所有残留引用及 Asset 记录
+            AssetReference.all_objects.filter(asset_id=asset_id).hard_delete()
+            Asset.all_objects.filter(id=asset_id).hard_delete()
+        else:
+            # 物理文件仍存在（被其他引用占用），无引用时才清理 Asset
+            if not AssetReference.all_objects.filter(asset_id=asset_id).exists():
+                Asset.all_objects.filter(id=asset_id).hard_delete()
 
     return {
         "removed_db_files": removed_db_files,

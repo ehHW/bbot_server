@@ -8,6 +8,7 @@ from .system_views import (
     SystemSettingsAPIView,
 )
 from . import views
+from .views import ReprocessVideosAPIView
 
 app_name = 'hyself'
 
@@ -36,6 +37,6 @@ urlpatterns = [
     path("upload/small/", views.UploadSmallFileAPIView.as_view(), name="upload_small"),
     path("upload/precheck/", views.UploadPrecheckAPIView.as_view(), name="upload_precheck"),
     path("upload/chunks/", views.UploadedChunksAPIView.as_view(), name="upload_chunks"),
-    path("upload/chunk/", views.UploadChunkAPIView.as_view(), name="upload_chunk"),
-    path("upload/merge/", views.UploadMergeAPIView.as_view(), name="upload_merge"),
+    path("upload/chunk/", views.UploadChunkAPIView.as_view(), name="upload_chunk"),    path("upload/merge/", views.UploadMergeAPIView.as_view(), name="upload_merge"),
+    path("upload/admin/reprocess-videos/", ReprocessVideosAPIView.as_view(), name="upload_admin_reprocess_videos"),
 ]

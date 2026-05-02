@@ -13,6 +13,9 @@ ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
 # 直接通过 pip 安装 uv，避免 COPY --from=ghcr.io/... 额外访问 ghcr
 RUN pip install --no-cache-dir uv
 
+# 安装 ffmpeg（视频转码 HLS 与缩略图截取所必需）
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 # 先只复制依赖描述文件，利用 Docker 层缓存
 COPY pyproject.toml uv.lock ./
 

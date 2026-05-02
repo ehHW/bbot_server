@@ -6,13 +6,56 @@
 
 ## 技术栈
 
-- Python 3.14+
-- Django 5.2
-- Django REST Framework
-- SimpleJWT
-- Channels + channels-redis
-- Celery + Redis
-- MySQL
+| 类别 | 名称 | 说明 |
+|------|------|------|
+| 语言 | Python 3.14+ | |
+| Web 框架 | Django 5.2 | ORM、迁移、管理后台 |
+| REST | Django REST Framework | 序列化、视图集、权限 |
+| 认证 | SimpleJWT | JWT 签发与刷新 |
+| WebSocket | Django Channels + channels-redis | 实时推送 |
+| 任务队列 | Celery + Redis | 视频转码、异步分片合并 |
+| 数据库 | MySQL | 主存储 |
+| 缓存/消息代理 | Redis | Channel layer + Celery broker |
+| Python 包管理 | uv | 推荐；也支持 venv + pip |
+
+## 外部依赖（系统级）
+
+这些工具 **不通过 pip 安装**，需要提前在操作系统中安装并加入 `PATH`，否则相关功能会报错。
+
+### FFmpeg / FFprobe
+
+| 工具 | 用途 |
+|------|------|
+| `ffprobe` | 视频上传后探测编码、时长、分辨率、字幕流 |
+| `ffmpeg` | 将视频转码为 HLS（`.m3u8` + `.ts` 分片）并截取封面缩略图 |
+
+> ⚠️ **未安装 FFmpeg 的常见现象**
+> - 视频发送后播放器进度条点击后重新从头播放（因为没有生成 HLS 分片，浏览器无法 seek）
+> - 视频消息缩略图缺失
+> - Celery 日志中出现 `未找到 ffmpeg，请先安装并加入 PATH` 或 `FileNotFoundError: [Errno 2]`
+
+**安装方式：**
+
+- **Windows**：从 <https://www.gyan.dev/ffmpeg/builds/> 下载 release build，解压后将 `bin/` 目录加入系统 PATH，或安装 [Scoop](https://scoop.sh/)：
+  ```powershell
+  scoop install ffmpeg
+  ```
+- **macOS**：
+  ```bash
+  brew install ffmpeg
+  ```
+- **Linux (Debian/Ubuntu)**：
+  ```bash
+  sudo apt install ffmpeg
+  ```
+- **Docker**：`Dockerfile` 已通过 `apt-get install -y ffmpeg` 内置，容器内无需额外配置。
+
+安装后验证：
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
 
 ## 安装依赖
 
@@ -71,28 +114,42 @@ python manage.py align_hyself_rename_metadata
 python manage.py reset_local_data --yes
 ```
 
-执行后会重建以下正式角色：
+命令行为：清空数据库（flush）、清空 uploads 目录，并重建正式角色与基础账号。
+
+重建的正式角色：
 
 - 超级管理员
 - 系统管理员
 - 普通用户
 
-并创建以下基础账号：
+重建的基础账号与默认密码（仅用于本地开发）：
 
-- admin
-- user01
-- user02
-- user03
-- user04
-- user05
+| 用户名 | 角色 | 默认密码 | 可覆盖参数 |
+|--------|------|---------|-----------|
+| superadmin | 超级管理员 | `000sa000` | `--superadmin-password` |
+| admin | 系统管理员 | `000a000` | `--admin-password` |
+| user01 | 普通用户 | `111u111` | - |
+| user02 | 普通用户 | `222u222` | - |
+| user03 | 普通用户 | `333u333` | - |
+| user04 | 普通用户 | `444u444` | - |
+| user05 | 普通用户 | `555u555` | - |
 
-命令会在终端输出本次生成的密码。
+说明：命令会在终端输出本次使用的密码。该命令为破坏性操作，请仅在本地开发环境运行，生产环境请勿运行。
 
 如果你希望直接通过独立脚本执行，也可以使用：
 
 ```bash
 python tools/reset_local_data.py --yes
 ```
+
+## 上传与资源中心（概要）
+
+- **上传通路**：小文件直传（`/api/upload/small/`）、分片上传（`/api/upload/precheck/` + `/api/upload/chunk/` + `/api/upload/merge/`）以及头像专线（`category=profile`）。
+- **去重策略**：基于文件 MD5；若 Asset 已存在则复用物理文件并仅创建新引用（AssetReference / UploadedFile 兼容层），回收站中的同 MD5 条目可被恢复并复用。
+- **分片合并**：合并任务可同步处理或委派给 Celery worker；若系统依赖异步 worker，未启动时相关接口会返回错误并提示启动 worker。
+- **权限映射**：头像/profile 不需额外权限；聊天附件受 `chat.send_attachment` 控制；资源中心操作使用 `file.*` 权限集合（如 `file.view_resource`、`file.delete_resource` 等）。
+- **临时分片目录**：位于临时根目录下（格式：`{user.id}_{file_md5}`），建议定期清理并监控磁盘配额。
+- **资源中心显示**：资源中心基于 AssetReference 与 UploadedFile 兼容层构建目录视图，上传完成后需创建相应的 asset_reference 才能在资源中心展示。
 
 ## 浏览器烟雾测试账号
 
@@ -175,6 +232,40 @@ python manage.py cleanup_recycle_bin
 ```bash
 python tools/cleanup_recycle_bin.py
 ```
+
+## 视频重新处理
+
+如果服务器之前未安装 ffmpeg，已上传的视频不会生成 HLS 分片，表现为播放器无法 seek（点进度条从头播放）、缩略图缺失。安装 ffmpeg 后，需对存量视频重新触发转码。
+
+**方式一：management command（推荐）**
+
+```bash
+# 重处理所有 failed / queued / 未处理 的视频（默认）
+python manage.py reprocess_videos
+
+# 预览将要处理的列表，不实际提交任务
+python manage.py reprocess_videos --dry-run
+
+# 强制全部重处理（含已 ready 的）
+python manage.py reprocess_videos --all
+
+# 只重处理单个 Asset
+python manage.py reprocess_videos --asset-id 42
+```
+
+**方式二：管理员 API**
+
+```http
+POST /api/upload/admin/reprocess-videos/
+Authorization: Bearer <superadmin_token>
+Content-Type: application/json
+
+{}                          # 默认：重处理 failed/queued/未处理
+{"force_all": true}         # 强制全部重处理
+{"asset_id": 42}            # 单个 Asset
+```
+
+> ⚠️ 需要 Celery worker 正在运行，且系统已安装 ffmpeg / ffprobe。
 
 ## 功能范围
 
@@ -269,7 +360,8 @@ hyself_server/
 2. 配置 .env 并执行迁移。
 3. 使用 uvicorn 启动 ASGI 服务，完整验证 REST 和 WebSocket。
 4. 如需大文件联调，额外启动 Celery worker。
-5. 再启动 hyself 前端进行联调。
+5. **确保系统已安装 ffmpeg / ffprobe**（视频进度条 seek 依赖 HLS 转码）。
+6. 再启动 hyself 前端进行联调。
 
 ## 相关文档
 

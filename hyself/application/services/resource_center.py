@@ -265,14 +265,20 @@ def resolve_existing_upload_file(
                 is_dir=False,
                 recycled_at__isnull=False,
             ).order_by("-recycled_at", "-id").first()
-
         if not existing:
-            existing = UploadedFile.objects.filter(
+            cross_user_candidate = UploadedFile.objects.filter(
                 file_md5=file_md5,
                 is_dir=False,
                 deleted_at__isnull=True,
                 recycled_at__isnull=True,
             ).exclude(created_by=user).exclude(relative_path="").order_by("-updated_at", "-id").first()
+            # 只有在物理文件真实存在时才允许跨用户复用，避免引用指向已被彻底删除的文件
+            if cross_user_candidate and cross_user_candidate.relative_path:
+                from hyself.utils.upload import get_upload_root
+                from pathlib import Path as _Path
+                physical_path = get_upload_root() / _Path(cross_user_candidate.relative_path)
+                if physical_path.exists() and physical_path.is_file():
+                    existing = cross_user_candidate
 
     if not existing and normalized_relative_path:
         existing = UploadedFile.objects.filter(

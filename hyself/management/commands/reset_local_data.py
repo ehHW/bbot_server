@@ -9,26 +9,29 @@ from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from user.models import DEFAULT_USER_ROLE_NAME, Role, SYSTEM_ADMIN_ROLE_NAME, User
+from user.models import DEFAULT_USER_ROLE_NAME, Role, SUPER_ADMIN_ROLE_NAME, SYSTEM_ADMIN_ROLE_NAME, User
 from user.signals import ensure_default_permissions_synced
 
 
 BASELINE_USERS = [
-    ("user01", "普通用户1"),
-    ("user02", "普通用户2"),
-    ("user03", "普通用户3"),
-    ("user04", "普通用户4"),
-    ("user05", "普通用户5"),
+    ("user01", "普通用户1", "111u111"),
+    ("user02", "普通用户2", "222u222"),
+    ("user03", "普通用户3", "333u333"),
+    ("user04", "普通用户4", "444u444"),
+    ("user05", "普通用户5", "555u555"),
 ]
+
+SUPERADMIN_DEFAULT_PASSWORD = "000sa000"
+ADMIN_DEFAULT_PASSWORD = "000a000"
 
 
 class Command(BaseCommand):
-    help = "清空本地开发数据与上传文件，并重建 admin、5 个普通用户与 3 个正式角色。"
+    help = "清空本地开发数据与上传文件，并重建 superadmin、admin、5 个普通用户与 3 个正式角色。"
 
     def add_arguments(self, parser):
         parser.add_argument("--yes", action="store_true", help="确认执行破坏性重置")
-        parser.add_argument("--admin-password", default="", help="指定 admin 密码；不传则自动生成")
-        parser.add_argument("--user-password", default="", help="指定 5 个普通用户统一密码；不传则自动生成")
+        parser.add_argument("--superadmin-password", default="", help="指定 superadmin 密码；不传则使用默认值")
+        parser.add_argument("--admin-password", default="", help="指定 admin 密码；不传则使用默认值")
 
     def _generate_password(self) -> str:
         return secrets.token_urlsafe(18)
@@ -41,22 +44,34 @@ class Command(BaseCommand):
                 shutil.rmtree(child)
             else:
                 child.unlink(missing_ok=True)
-
+    
     @transaction.atomic
-    def _bootstrap_users(self, admin_password: str, user_password: str) -> None:
+    def _bootstrap_users(self, superadmin_password: str, admin_password: str) -> None:
         ensure_default_permissions_synced()
         default_role = Role.all_objects.get(name=DEFAULT_USER_ROLE_NAME)
-        Role.all_objects.get(name=SYSTEM_ADMIN_ROLE_NAME)
+        system_admin_role = Role.all_objects.get(name=SYSTEM_ADMIN_ROLE_NAME)
 
-        admin_user = User.objects.create_superuser(
-            username="admin",
-            password=admin_password,
-            display_name="admin",
+        # 超级管理员
+        superadmin_user = User.objects.create_superuser(
+            username="superadmin",
+            password=superadmin_password,
+            display_name="超级管理员",
             email="",
         )
-        admin_user.roles.add(Role.all_objects.get(name="超级管理员"))
+        superadmin_user.roles.add(Role.all_objects.get(name=SUPER_ADMIN_ROLE_NAME))
 
-        for username, display_name in BASELINE_USERS:
+        # 系统管理员
+        admin_user = User.objects.create_user(
+            username="admin",
+            password=admin_password,
+            display_name="管理员",
+            email="",
+            is_active=True,
+        )
+        admin_user.roles.add(system_admin_role)
+
+        # 普通用户
+        for username, display_name, user_password in BASELINE_USERS:
             user = User.objects.create_user(
                 username=username,
                 password=user_password,
@@ -70,8 +85,8 @@ class Command(BaseCommand):
         if not options["yes"]:
             raise CommandError("这是破坏性操作，请显式传入 --yes")
 
-        admin_password = str(options.get("admin_password") or "").strip() or self._generate_password()
-        user_password = str(options.get("user_password") or "").strip() or self._generate_password()
+        superadmin_password = str(options.get("superadmin_password") or "").strip() or SUPERADMIN_DEFAULT_PASSWORD
+        admin_password = str(options.get("admin_password") or "").strip() or ADMIN_DEFAULT_PASSWORD
 
         self.stdout.write(self.style.WARNING("开始清空本地数据库数据..."))
         call_command("flush", interactive=False, verbosity=0)
@@ -80,10 +95,10 @@ class Command(BaseCommand):
         self._clear_upload_root()
 
         self.stdout.write(self.style.WARNING("开始重建角色与基线用户..."))
-        self._bootstrap_users(admin_password, user_password)
+        self._bootstrap_users(superadmin_password, admin_password)
 
         self.stdout.write(self.style.SUCCESS("本地数据重置完成"))
-        self.stdout.write(f"admin username: admin")
-        self.stdout.write(f"admin password: {admin_password}")
-        self.stdout.write(f"normal users: {', '.join(username for username, _ in BASELINE_USERS)}")
-        self.stdout.write(f"normal password: {user_password}")
+        self.stdout.write(f"superadmin username: superadmin  password: {superadmin_password}")
+        self.stdout.write(f"admin    username: admin       password: {admin_password}")
+        for username, _, user_password in BASELINE_USERS:
+            self.stdout.write(f"user     username: {username:<8} password: {user_password}")

@@ -415,8 +415,7 @@ class UploadMergeAPIView(APIView):
                 file_name=file_name,
                 total_chunks=total_chunks,
                 file_size=file_size,
-                parent_id=parent_id,
-                relative_path=relative_path,
+                parent_id=parent_id,                relative_path=relative_path,
                 category=category,
             )
         except UploadMergeServiceUnavailableError as exc:
@@ -425,3 +424,75 @@ class UploadMergeAPIView(APIView):
             return _response_from_validation_error(exc, not_found_details=("目标目录不存在",))
 
         return Response(result)
+
+
+class ReprocessVideosAPIView(APIView):
+    """
+    POST /api/upload/admin/reprocess-videos/
+
+    对视频 Asset 重新触发 HLS 转码任务。仅超级管理员可调用。
+
+    请求体（均可选）：
+        asset_id   int   — 指定单个 Asset ID；不传则批量处理
+        statuses   list  — 过滤状态，默认 ["failed", "queued", ""]
+        force_all  bool  — true 时包含 ready 状态（强制全部重处理）
+
+    返回：
+        { queued: int, skipped: int, items: [{id, name, prev_status}] }
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not request.user.is_superuser:
+            return Response({"detail": "仅超级管理员可操作"}, status=status.HTTP_403_FORBIDDEN)
+
+        from hyself.models import Asset
+        from hyself.tasks import process_video_asset_task
+        from hyself.video_processing import VIDEO_PROCESSING_KEY, mark_video_processing_status
+
+        asset_id = request.data.get("asset_id")
+        force_all: bool = bool(request.data.get("force_all", False))
+        requested_statuses: list[str] = list(request.data.get("statuses") or ["failed", "queued", ""])
+
+        qs = Asset.objects.filter(
+            media_type=Asset.MediaType.VIDEO,
+            storage_backend=Asset.StorageBackend.LOCAL,
+            deleted_at__isnull=True,
+        )
+        if asset_id is not None:
+            qs = qs.filter(id=int(asset_id))
+
+        queued = 0
+        skipped = 0
+        items = []
+
+        for asset in qs.iterator():
+            metadata = dict(asset.extra_metadata or {})
+            vp = dict(metadata.get(VIDEO_PROCESSING_KEY) or {})
+            prev_status = str(vp.get("status") or "").strip()
+
+            should_process = (
+                asset_id is not None
+                or force_all
+                or prev_status in requested_statuses
+            )
+
+            if not should_process:
+                skipped += 1
+                continue
+
+            mark_video_processing_status(asset, status="queued")
+            process_video_asset_task.delay(asset.id)
+            queued += 1
+            items.append({
+                "id": asset.id,
+                "name": asset.original_name or "",
+                "prev_status": prev_status or "(未处理)",
+            })
+
+        return Response({
+            "queued": queued,
+            "skipped": skipped,
+            "items": items,
+        })

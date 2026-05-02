@@ -90,6 +90,13 @@ def serialize_message(message: ChatMessage, *, include_deleted_metadata: bool = 
                     "video_processing": video_processing,
                     "audio_processing": audio_processing,
                 }
+                payload.pop("asset_expired", None)
+            else:
+                # 文件已被删除或引用不存在，标记为已过期，清空失效 URL
+                payload["asset_expired"] = True
+                payload["url"] = ""
+                payload["stream_url"] = ""
+                payload["thumbnail_url"] = ""
     reply_payload = payload.get("reply_to_message")
     if isinstance(reply_payload, dict) and isinstance(reply_payload.get("id"), int):
         reply_message = ChatMessage.objects.filter(id=reply_payload["id"]).first()
