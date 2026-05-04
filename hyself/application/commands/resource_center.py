@@ -17,6 +17,8 @@ from hyself.application.services.resource_center import (
 from hyself.models import Asset, AssetReference, UploadedFile
 from hyself.recycle_bin import is_recycle_bin_folder, move_entry_to_recycle_bin, restore_entry_from_recycle_bin
 from hyself.utils.upload import build_stored_name, get_upload_root
+from hyself.video_processing import VIDEO_ARTIFACTS_ROOT, VIDEO_PROCESSING_KEY
+from hyself.audio_processing import AUDIO_ARTIFACTS_ROOT, AUDIO_PROCESSING_KEY
 
 
 User = get_user_model()
@@ -68,12 +70,16 @@ def hard_delete_uploaded_entry(entry: UploadedFile) -> dict:
             continue
         target_path = get_upload_root() / Path(relative_path)
         if target_path.exists() and target_path.is_file():
-            target_path.unlink()
-            removed_disk_files += 1
-        # 记录该路径对应的 asset_id，后续强制清理
-        matched_asset_id = path_to_asset_id.get(relative_path)
-        if matched_asset_id:
-            deleted_asset_ids.add(matched_asset_id)
+            try:
+                target_path.unlink()
+                removed_disk_files += 1
+                # 记录该路径对应的 asset_id，后续强制清理
+                matched_asset_id = path_to_asset_id.get(relative_path)
+                if matched_asset_id:
+                    deleted_asset_ids.add(matched_asset_id)
+            except PermissionError:
+                # 文件被其他进程占用（Windows），跳过物理删除，仅清理数据库记录
+                pass
 
     for asset_id in asset_ids:
         if asset_id in deleted_asset_ids:
@@ -108,6 +114,73 @@ def reset_system_resource_center(*, acting_user) -> dict:
         removed_db_files += int(result.get("removed_db_files", 0) or 0)
         removed_db_dirs += int(result.get("removed_db_dirs", 0) or 0)
         removed_disk_files += int(result.get("removed_disk_files", 0) or 0)
+
+    # --- 补充清理：兜底删除所有残留记录和物理文件 ---
+    upload_root = get_upload_root()
+
+    # 1. 清理所有残留的 AssetReference（不含 chat 域的，那属于聊天消息）
+    orphan_refs = AssetReference.all_objects.exclude(ref_domain="chat")
+    orphan_refs.hard_delete()
+
+    # 2. 清理所有残留的 Asset，并删除对应物理文件及 artifacts 目录
+    remaining_assets = list(Asset.all_objects.all())
+    removed_asset_disk = 0
+    for asset in remaining_assets:
+        # 删除原始文件
+        if asset.storage_key:
+            file_path = upload_root / Path(asset.storage_key)
+            if file_path.exists() and file_path.is_file():
+                try:
+                    file_path.unlink()
+                    removed_asset_disk += 1
+                except PermissionError:
+                    pass
+
+        # 删除视频 artifacts 目录
+        metadata = dict(asset.extra_metadata or {})
+        video_processing = dict(metadata.get(VIDEO_PROCESSING_KEY) or {})
+        artifact_dir_path = str(video_processing.get("artifact_directory_path") or "").strip()
+        if artifact_dir_path:
+            artifact_abs = upload_root / Path(artifact_dir_path)
+            if artifact_abs.exists() and artifact_abs.is_dir():
+                try:
+                    import shutil as _shutil
+                    _shutil.rmtree(artifact_abs, ignore_errors=True)
+                except Exception:
+                    pass
+
+        # 删除音频 artifacts 目录
+        audio_processing = dict(metadata.get(AUDIO_PROCESSING_KEY) or {})
+        audio_stream_path = str(audio_processing.get("stream_relative_path") or "").strip()
+        if audio_stream_path:
+            # audio artifacts 目录是 stream 文件的父目录
+            audio_artifact_dir = (upload_root / Path(audio_stream_path)).parent
+            if audio_artifact_dir.exists() and audio_artifact_dir.is_dir():
+                try:
+                    import shutil as _shutil
+                    _shutil.rmtree(audio_artifact_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+    Asset.all_objects.all().hard_delete()
+    removed_disk_files += removed_asset_disk
+
+    # 3. 清理所有残留的 UploadedFile（兜底）
+    UploadedFile.all_objects.all().hard_delete()
+
+    # 4. 删除 video_artifacts 和 audio_artifacts 根目录（彻底清空）
+    for artifacts_dir_name in (VIDEO_ARTIFACTS_ROOT, AUDIO_ARTIFACTS_ROOT):
+        artifacts_root = upload_root / artifacts_dir_name
+        if artifacts_root.exists() and artifacts_root.is_dir():
+            try:
+                import shutil as _shutil
+                for child in artifacts_root.iterdir():
+                    if child.is_dir():
+                        _shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return {
         "detail": "系统资源已归零",

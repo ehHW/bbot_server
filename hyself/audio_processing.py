@@ -122,7 +122,7 @@ def queue_audio_processing(asset: Asset) -> None:
 
     metadata = dict(asset.extra_metadata or {})
     audio_processing = dict(metadata.get(AUDIO_PROCESSING_KEY) or {})
-    if audio_processing.get("status") in {"queued", "processing", "ready"}:
+    if audio_processing.get("status") in {"processing", "ready"}:
         return
     mark_audio_processing_status(asset, status="queued")
     process_audio_asset_task.delay(asset.id)

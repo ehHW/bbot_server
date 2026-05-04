@@ -197,7 +197,7 @@ def queue_video_processing(asset: Asset) -> None:
 
     metadata = dict(asset.extra_metadata or {})
     video_processing = dict(metadata.get(VIDEO_PROCESSING_KEY) or {})
-    if video_processing.get("status") in {"queued", "processing", "ready"}:
+    if video_processing.get("status") in {"processing", "ready"}:
         return
     mark_video_processing_status(asset, status="queued")
     process_video_asset_task.delay(asset.id)

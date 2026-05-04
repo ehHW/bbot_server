@@ -8,6 +8,7 @@ from rest_framework.views import APIView
 from chat.application.commands import (
     execute_create_group_conversation_command,
     execute_delete_message_for_user_command,
+    execute_batch_delete_messages_for_user_command,
     execute_forward_messages_command,
     execute_hide_conversation_command,
     execute_mark_conversation_read_command,
@@ -237,6 +238,25 @@ class MessageDeleteAPIView(APIView):
             payload = execute_delete_message_for_user_command(request.user, message_id)
         except ChatMessage.DoesNotExist:
             return Response({"detail": "消息不存在"}, status=status.HTTP_404_NOT_FOUND)
+        except PermissionDenied as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        return Response(payload)
+
+
+class MessageBatchDeleteAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ensure_request_permission(request, "chat.delete_message")
+        message_ids = request.data.get("message_ids", [])
+        if not isinstance(message_ids, list) or not message_ids:
+            return Response({"detail": "message_ids 不能为空"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            message_ids = [int(i) for i in message_ids]
+        except (ValueError, TypeError):
+            return Response({"detail": "message_ids 格式不正确"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            payload = execute_batch_delete_messages_for_user_command(request.user, message_ids)
         except PermissionDenied as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
         return Response(payload)
